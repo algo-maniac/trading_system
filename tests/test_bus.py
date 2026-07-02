@@ -66,3 +66,35 @@ def test_publish_alert_writes_to_alert_stream(bus):
     entries = bus._r.xrange("test.alerts")
     assert len(entries) == 1
     assert entries[0][1]["kind"] == "token_expired"
+
+
+# --- SignalEvent serde ---
+
+def test_signal_serde_roundtrip_identity():
+    from datetime import datetime, timezone
+
+    from trading_system.bus.signals import (
+        SignalEvent, fields_to_signal, signal_id, signal_to_fields,
+    )
+
+    sig = SignalEvent(
+        id=signal_id("momentum", "xsec_momentum", "RELIANCE",
+                     datetime(2026, 7, 3, 9, 30, tzinfo=timezone.utc), "BUY"),
+        ts=datetime(2026, 7, 3, 9, 30, tzinfo=timezone.utc),
+        sleeve="momentum", strategy="xsec_momentum", symbol="RELIANCE", side="BUY",
+        size_hint=0.05, stop_pct=None, target_pct=0.1234567891011,
+        trailing_stop_pct=None, trailing_atr_mult=3.0,
+        reason="xsec_entry top20", features={"momentum_252_21": 0.42}, ref_price=2914.35,
+    )
+    assert fields_to_signal(signal_to_fields(sig)) == sig
+
+
+def test_signal_id_deterministic():
+    from datetime import datetime, timezone
+
+    from trading_system.bus.signals import signal_id
+
+    ts = datetime(2026, 7, 3, 9, 30, tzinfo=timezone.utc)
+    a = signal_id("s", "strat", "SYM", ts, "BUY")
+    assert a == signal_id("s", "strat", "SYM", ts, "BUY")
+    assert a != signal_id("s", "strat", "SYM", ts, "SELL")

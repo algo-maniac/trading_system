@@ -66,6 +66,35 @@ services:
     # Forward/paper-test the existing daily momentum strategy off the live bar stream.
     command: ["python", "-m", "trading_system.agents.backtester.app", "--mode", "forward", "--strategy", "momentum", "--interval", "day"]
 
+  # --- Phase 5a: paper-trading pipeline -------------------------------------
+  strategist:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.strategist.app"]
+
+  trader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.trader.app"]
+
 volumes:
   timescaledb_data:
   redis_data:

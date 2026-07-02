@@ -125,7 +125,17 @@ class Settings(BaseSettings):
     # Bus (Redis Streams) — stream keys + caps
     bus_bar_stream: str = "market.bars"
     bus_alert_stream: str = "alerts"
+    bus_signal_stream: str = "trade.signals"
     bus_maxlen: int = 500_000               # approximate cap (XADD MAXLEN ~) on the bar stream
+
+    # Paper-trading book (Phase 5a) — sleeve capital fractions of paper_capital.
+    # These are the Phase 5R/5V validated sleeves; params live in the strategy defaults
+    # plus the overrides in agents/strategist/app.py's SLEEVES.
+    paper_capital: float = 1_000_000.0
+    paper_sleeve_weights: dict[str, float] = Field(
+        default_factory=lambda: {"momentum": 0.30, "stabilizer": 0.50, "event_intraday": 0.20}
+    )
+    paper_slippage_bps: float = 5.0
 
     # Kite API behaviour
     kite_historical_rps: float = 3.0       # max requests per second (Zerodha hard limit)

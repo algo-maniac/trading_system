@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import redis
 
 from trading_system.bus.serde import bar_to_fields, fields_to_bar
+from trading_system.bus.signals import SignalEvent, fields_to_signal, signal_to_fields
 from trading_system.config import get_settings
 from trading_system.observability import get_logger
 from trading_system.replay.events import BarEvent
@@ -101,4 +102,59 @@ class RedisBarBus:
         for _stream, messages in resp:  # type: ignore[misc]
             for msg_id, fields in messages:
                 out.append((msg_id, fields_to_bar(fields)))
+        return out
+
+
+class RedisSignalBus:
+    """SignalEvent stream (`trade.signals`) — same consumer-group/at-least-once pattern
+    as RedisBarBus, carrying the Strategist→Trader/Analyst trade intents."""
+
+    def __init__(
+        self,
+        client: "redis.Redis | None" = None,
+        *,
+        signal_stream: str | None = None,
+        maxlen: int | None = None,
+    ) -> None:
+        s = get_settings()
+        self._r = client or redis.Redis.from_url(s.redis_url, decode_responses=True)
+        self._stream = signal_stream or s.bus_signal_stream
+        self._maxlen = maxlen if maxlen is not None else s.bus_maxlen
+
+    def publish(self, sig: SignalEvent) -> str:
+        msg_id: str = self._r.xadd(
+            self._stream, signal_to_fields(sig), maxlen=self._maxlen, approximate=True
+        )
+        return msg_id
+
+    def ensure_group(self, group: str, start_id: str = "$") -> None:
+        try:
+            self._r.xgroup_create(self._stream, group, id=start_id, mkstream=True)
+        except redis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    def poll(
+        self, group: str, consumer: str, count: int = 100, block_ms: int = 1000
+    ) -> list[tuple[str, SignalEvent]]:
+        self.ensure_group(group)
+        resp = self._r.xreadgroup(group, consumer, {self._stream: ">"}, count=count, block=block_ms)
+        return self._flatten(resp)
+
+    def read_pending(self, group: str, consumer: str, count: int = 100) -> list[tuple[str, SignalEvent]]:
+        self.ensure_group(group)
+        resp = self._r.xreadgroup(group, consumer, {self._stream: "0"}, count=count)
+        return self._flatten(resp)
+
+    def ack(self, group: str, msg_id: str) -> None:
+        self._r.xack(self._stream, group, msg_id)
+
+    @staticmethod
+    def _flatten(resp: object) -> list[tuple[str, SignalEvent]]:
+        out: list[tuple[str, SignalEvent]] = []
+        if not resp:
+            return out
+        for _stream, messages in resp:  # type: ignore[misc]
+            for msg_id, fields in messages:
+                out.append((msg_id, fields_to_signal(fields)))
         return out
