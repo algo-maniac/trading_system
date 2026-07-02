@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading_db
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      # Schema is applied on first container start (empty volume only)
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # --- Service agents (same image, different command) ----------------------
+  # Secrets (KITE_API_KEY/SECRET) come from the gitignored .env; the DB/Redis URLs are
+  # overridden here to use in-network service names instead of localhost.
+  reader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.reader.app"]
+
+  backtester:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Forward/paper-test the existing daily momentum strategy off the live bar stream.
+    command: ["python", "-m", "trading_system.agents.backtester.app", "--mode", "forward", "--strategy", "momentum", "--interval", "day"]
+
+volumes:
+  timescaledb_data:
+  redis_data:
