@@ -41,47 +41,50 @@ SLEEVES = [
 def main() -> int:
     s = get_settings()
     setup_logging(s.log_level)
-    conn = get_connection().__enter__()
-    ledger = PostgresLedger(conn)
-    broker = PaperBroker(ledger, slippage_bps=s.paper_slippage_bps, fees_enabled=True)
-    core = TraderCore(ledger, broker, SLEEVES, s.paper_capital, s.paper_sleeve_weights)
+    # `with` (not get_connection().__enter__()) — the latter drops the context-manager
+    # reference immediately, and CPython garbage-collecting it triggers __exit__ on the
+    # generator, closing the connection within microseconds ("the connection is closed").
+    with get_connection() as conn:
+        ledger = PostgresLedger(conn)
+        broker = PaperBroker(ledger, slippage_bps=s.paper_slippage_bps, fees_enabled=True)
+        core = TraderCore(ledger, broker, SLEEVES, s.paper_capital, s.paper_sleeve_weights)
 
-    bar_bus = RedisBarBus()
-    signal_bus = RedisSignalBus()
+        bar_bus = RedisBarBus()
+        signal_bus = RedisSignalBus()
 
-    stop = {"flag": False}
+        stop = {"flag": False}
 
-    def _handle(signum: int, _frame: object) -> None:
-        logger.info("trader_shutdown_signal", signum=signum)
-        stop["flag"] = True
+        def _handle(signum: int, _frame: object) -> None:
+            logger.info("trader_shutdown_signal", signum=signum)
+            stop["flag"] = True
 
-    signal.signal(signal.SIGINT, _handle)
-    signal.signal(signal.SIGTERM, _handle)
+        signal.signal(signal.SIGINT, _handle)
+        signal.signal(signal.SIGTERM, _handle)
 
-    logger.info("trader_start", sleeves=[sl.name for sl in SLEEVES])
-    # Crash recovery: drain this consumer's un-acked messages first.
-    for msg_id, sig in signal_bus.read_pending(GROUP, CONSUMER):
-        core.on_signal(sig)
-        signal_bus.ack(GROUP, msg_id)
-    for msg_id, bar in bar_bus.read_pending(GROUP, CONSUMER):
-        core.on_bar(bar)
-        bar_bus.ack(GROUP, msg_id)
-
-    last_snapshot_day = None
-    while not stop["flag"]:
-        for msg_id, sig in signal_bus.poll(GROUP, CONSUMER, block_ms=200):
+        logger.info("trader_start", sleeves=[sl.name for sl in SLEEVES])
+        # Crash recovery: drain this consumer's un-acked messages first.
+        for msg_id, sig in signal_bus.read_pending(GROUP, CONSUMER):
             core.on_signal(sig)
             signal_bus.ack(GROUP, msg_id)
-        for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=200):
+        for msg_id, bar in bar_bus.read_pending(GROUP, CONSUMER):
             core.on_bar(bar)
             bar_bus.ack(GROUP, msg_id)
-        now = datetime.now(UTC)
-        # IST session close ≈ 10:05 UTC; snapshot once after 10:05 UTC each weekday.
-        if now.time() >= time(10, 5) and last_snapshot_day != now.date():
-            core.snapshot(now)
-            last_snapshot_day = now.date()
-    core.snapshot(datetime.now(UTC))
-    logger.info("trader_stopped")
+
+        last_snapshot_day = None
+        while not stop["flag"]:
+            for msg_id, sig in signal_bus.poll(GROUP, CONSUMER, block_ms=200):
+                core.on_signal(sig)
+                signal_bus.ack(GROUP, msg_id)
+            for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=200):
+                core.on_bar(bar)
+                bar_bus.ack(GROUP, msg_id)
+            now = datetime.now(UTC)
+            # IST session close ≈ 10:05 UTC; snapshot once after 10:05 UTC each weekday.
+            if now.time() >= time(10, 5) and last_snapshot_day != now.date():
+                core.snapshot(now)
+                last_snapshot_day = now.date()
+        core.snapshot(datetime.now(UTC))
+        logger.info("trader_stopped")
     return 0
 
 

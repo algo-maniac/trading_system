@@ -34,38 +34,41 @@ SLEEVE_SPECS: list[tuple[str, str, dict, str]] = [
 
 def main() -> int:
     setup_logging(get_settings().log_level)
-    conn = get_connection().__enter__()  # long-lived connection for the agent's lifetime
-    ledger = PostgresLedger(conn)
-    signal_bus = RedisSignalBus()
-    bar_bus = RedisBarBus()
+    # `with` (not get_connection().__enter__()) — the latter drops the context-manager
+    # reference immediately, and CPython garbage-collecting it triggers __exit__ on the
+    # generator, closing the connection within microseconds ("the connection is closed").
+    with get_connection() as conn:
+        ledger = PostgresLedger(conn)
+        signal_bus = RedisSignalBus()
+        bar_bus = RedisBarBus()
 
-    sleeves = [
-        Sleeve(name=name, strategy=get_strategy(strat, **params), interval=interval,
-               view=LivePortfolio(ledger, name))
-        for name, strat, params, interval in SLEEVE_SPECS
-    ]
-    runner = StrategistRunner(sleeves, publish=signal_bus.publish)
+        sleeves = [
+            Sleeve(name=name, strategy=get_strategy(strat, **params), interval=interval,
+                   view=LivePortfolio(ledger, name))
+            for name, strat, params, interval in SLEEVE_SPECS
+        ]
+        runner = StrategistRunner(sleeves, publish=signal_bus.publish)
 
-    stop = {"flag": False}
+        stop = {"flag": False}
 
-    def _handle(signum: int, _frame: object) -> None:
-        logger.info("strategist_shutdown_signal", signum=signum)
-        stop["flag"] = True
+        def _handle(signum: int, _frame: object) -> None:
+            logger.info("strategist_shutdown_signal", signum=signum)
+            stop["flag"] = True
 
-    signal.signal(signal.SIGINT, _handle)
-    signal.signal(signal.SIGTERM, _handle)
+        signal.signal(signal.SIGINT, _handle)
+        signal.signal(signal.SIGTERM, _handle)
 
-    logger.info("strategist_start", sleeves=[s.name for s in sleeves])
-    # Replay this consumer's own un-acked messages first (crash recovery), then live.
-    for msg_id, bar in bar_bus.read_pending(GROUP, CONSUMER):
-        runner.on_bar(bar)
-        bar_bus.ack(GROUP, msg_id)
-    while not stop["flag"]:
-        for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=1000):
+        logger.info("strategist_start", sleeves=[s.name for s in sleeves])
+        # Replay this consumer's own un-acked messages first (crash recovery), then live.
+        for msg_id, bar in bar_bus.read_pending(GROUP, CONSUMER):
             runner.on_bar(bar)
             bar_bus.ack(GROUP, msg_id)
-    runner.flush()
-    logger.info("strategist_stopped")
+        while not stop["flag"]:
+            for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=1000):
+                runner.on_bar(bar)
+                bar_bus.ack(GROUP, msg_id)
+        runner.flush()
+        logger.info("strategist_stopped")
     return 0
 
 
