@@ -34,10 +34,14 @@ services:
       timeout: 3s
       retries: 3
 
-  # --- Service agents (same image, different command) ----------------------
+  # --- Service agents (ONE shared image, different command per service) -----
+  # `image:` pins all four to the same tag so `docker compose build` builds it
+  # ONCE (whichever service builds first) and the rest reuse it — without this,
+  # Compose has no way to know they're the same image and rebuilds per-service.
   # Secrets (KITE_API_KEY/SECRET) come from the gitignored .env; the DB/Redis URLs are
   # overridden here to use in-network service names instead of localhost.
   reader:
+    image: trading-system:latest
     build: .
     restart: unless-stopped
     env_file: .env
@@ -52,7 +56,7 @@ services:
     command: ["python", "-m", "trading_system.agents.reader.app"]
 
   backtester:
-    build: .
+    image: trading-system:latest
     restart: unless-stopped
     env_file: .env
     environment:
@@ -68,7 +72,7 @@ services:
 
   # --- Phase 5a: paper-trading pipeline -------------------------------------
   strategist:
-    build: .
+    image: trading-system:latest
     restart: unless-stopped
     env_file: .env
     environment:
@@ -82,7 +86,7 @@ services:
     command: ["python", "-m", "trading_system.agents.strategist.app"]
 
   trader:
-    build: .
+    image: trading-system:latest
     restart: unless-stopped
     env_file: .env
     environment:
