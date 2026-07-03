@@ -8,6 +8,7 @@ Run as a container:
 import signal
 import sys
 
+from trading_system.agents.heartbeat import Heartbeat
 from trading_system.agents.strategist.runner import Sleeve, StrategistRunner
 from trading_system.bus.redis_streams import RedisBarBus, RedisSignalBus
 from trading_system.config import get_settings
@@ -59,6 +60,7 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _handle)
 
         logger.info("strategist_start", sleeves=[s.name for s in sleeves])
+        heartbeat = Heartbeat(interval_seconds=60.0)
         # Replay this consumer's own un-acked messages first (crash recovery), then live.
         for msg_id, bar in bar_bus.read_pending(GROUP, CONSUMER):
             runner.on_bar(bar)
@@ -67,6 +69,17 @@ def main() -> int:
             for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=1000):
                 runner.on_bar(bar)
                 bar_bus.ack(GROUP, msg_id)
+            # Day-mode gets exactly one batch/day — without this, a cross-sectional
+            # sleeve's signals wait for TOMORROW's batch to trigger the flush, delaying
+            # every entry by a full trading day. 90s safely clears the reader's
+            # few-second all-symbols publish burst before treating a batch as complete.
+            runner.flush_idle(idle_seconds=90.0)
+            # Alive-but-silent is the common case (most bars don't trigger a signal) —
+            # without this, "quietly working" and "quietly stuck" look identical in logs.
+            heartbeat.tick(
+                "strategist_heartbeat", bars_processed=runner.bars_processed,
+                signals_published=runner.signals_published,
+            )
         runner.flush()
         logger.info("strategist_stopped")
     return 0

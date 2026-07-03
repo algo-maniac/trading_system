@@ -15,7 +15,7 @@ which is immaterial for max_hold≈10 exits and avoids a calendar lookup here.
 State is re-read from the ledger on demand (cheap at our position counts) so a
 restarted agent sees exactly what a never-restarted one would — the crash-only design.
 """
-from datetime import datetime
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -33,6 +33,12 @@ class LivePortfolio:
 
     def update_price(self, symbol: str, price: float, ts: datetime) -> None:
         self._last_price[symbol] = price
+        # Belt-and-suspenders: bars from different sources (WebSocket ticks vs. Postgres
+        # day-bars) have crashed this comparison once already when one arrived naive and
+        # the other tz-aware. The real fix is normalizing at each source; this guard
+        # stops any future source regression from taking the whole agent down.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
         if self._now is None or ts > self._now:
             self._now = ts
 

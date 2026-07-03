@@ -9,6 +9,7 @@ import signal
 import sys
 from datetime import UTC, datetime, time
 
+from trading_system.agents.heartbeat import Heartbeat
 from trading_system.agents.trader.core import SleeveExecution, TraderCore
 from trading_system.bus.redis_streams import RedisBarBus, RedisSignalBus
 from trading_system.config import get_settings
@@ -71,6 +72,7 @@ def main() -> int:
             bar_bus.ack(GROUP, msg_id)
 
         last_snapshot_day = None
+        heartbeat = Heartbeat(interval_seconds=60.0)
         while not stop["flag"]:
             for msg_id, sig in signal_bus.poll(GROUP, CONSUMER, block_ms=200):
                 core.on_signal(sig)
@@ -78,6 +80,10 @@ def main() -> int:
             for msg_id, bar in bar_bus.poll(GROUP, CONSUMER, block_ms=200):
                 core.on_bar(bar)
                 bar_bus.ack(GROUP, msg_id)
+            heartbeat.tick(
+                "trader_heartbeat", bars_processed=core.bars_processed,
+                signals_handled=core.signals_handled,
+            )
             now = datetime.now(UTC)
             # IST session close ≈ 10:05 UTC; snapshot once after 10:05 UTC each weekday.
             if now.time() >= time(10, 5) and last_snapshot_day != now.date():

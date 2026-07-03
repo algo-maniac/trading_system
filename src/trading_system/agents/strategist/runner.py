@@ -10,10 +10,19 @@ timestamp and the sleeve's on_bars() fires when the timestamp advances (or on fl
 Position awareness comes from read-only LivePortfolio views over the Trader's ledger —
 one source of truth for "am I holding X?".
 
+Live day-mode gets exactly ONE batch per calendar day (the EOD reader's single publish
+cycle) — waiting for "the timestamp advances" to flush it would mean waiting for
+TOMORROW's batch to arrive, delaying every signal by a full trading day. `flush_idle()`
+covers this: called periodically from app.py, it flushes any batch that's gone quiet for
+longer than a threshold (the reader publishes all ~200 symbols within a few seconds of
+each other, so even a short idle window safely distinguishes "still trickling in" from
+"today's batch is complete").
+
 Signal ids are deterministic (sleeve|strategy|symbol|ts|side) so the at-least-once bus
 can redeliver anything and downstream consumers dedupe. Publishing is an injected
 callable → unit tests run without Redis.
 """
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -39,14 +48,24 @@ class StrategistRunner:
         self,
         sleeves: list[Sleeve],
         publish: Callable[[SignalEvent], None],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._sleeves = sleeves
         self._publish = publish
+        self._clock = clock
         # per cross-sectional sleeve: (current_ts, buffered bars)
         self._batches: dict[str, tuple[object, list[BarEvent]]] = {}
+        # per cross-sectional sleeve: monotonic time of its last bar — drives flush_idle
+        self._batch_last_update: dict[str, float] = {}
+        # Liveness counters (app.py logs these as a periodic heartbeat — otherwise a
+        # sleeve with no fires today is indistinguishable in the logs from a stuck
+        # consumer; both are silent).
+        self.bars_processed = 0
+        self.signals_published = 0
 
     def on_bar(self, bar: BarEvent) -> int:
         """Route one bar to every matching sleeve. Returns #signals published."""
+        self.bars_processed += 1
         published = 0
         for sleeve in self._sleeves:
             if bar.interval != sleeve.interval:
@@ -66,6 +85,23 @@ class StrategistRunner:
                 published += self._flush_batch(sleeve)
         return published
 
+    def flush_idle(self, idle_seconds: float) -> int:
+        """Flush any cross-sectional batch that hasn't received a bar in `idle_seconds`.
+
+        Call periodically from the app loop. Safe to call every iteration — it only
+        acts once a batch is genuinely stale, never mid-trickle.
+        """
+        now = self._clock()
+        published = 0
+        for sleeve in self._sleeves:
+            if not sleeve.strategy.cross_sectional:
+                continue
+            _, batch = self._batches.get(sleeve.name, (None, []))
+            last = self._batch_last_update.get(sleeve.name)
+            if batch and last is not None and now - last >= idle_seconds:
+                published += self._flush_batch(sleeve)
+        return published
+
     # --- internals -------------------------------------------------------------
 
     def _feed_batched(self, sleeve: Sleeve, bar: BarEvent) -> int:
@@ -75,6 +111,7 @@ class StrategistRunner:
             published += self._flush_batch(sleeve)
             current_ts, batch = None, []
         self._batches[sleeve.name] = (bar.ts, batch + [bar])
+        self._batch_last_update[sleeve.name] = self._clock()
         return published
 
     def _flush_batch(self, sleeve: Sleeve) -> int:
@@ -82,6 +119,7 @@ class StrategistRunner:
         if not batch:
             return 0
         self._batches[sleeve.name] = (None, [])
+        self._batch_last_update.pop(sleeve.name, None)
         signals = sleeve.strategy.on_bars(batch, sleeve.view)
         prices = {b.symbol: b.close for b in batch}
         return self._emit(sleeve, current_ts, prices, signals)
@@ -104,6 +142,7 @@ class StrategistRunner:
                 ref_price=prices.get(sig.symbol, 0.0),
             )
             self._publish(event)
+            self.signals_published += 1
             logger.info(
                 "signal_published", sleeve=sleeve.name, symbol=sig.symbol,
                 side=sig.side.value, reason=sig.reason, sid=event.id[:12],

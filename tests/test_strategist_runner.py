@@ -82,3 +82,37 @@ def test_signal_ids_deterministic_and_unique_per_side():
     assert out[0].id == out[1].id                     # dedupe key survives redelivery
     runner.on_bar(_bar(2, "A", interval="5minute"))
     assert out[2].id != out[0].id
+
+
+# --- flush_idle: live day-mode gets one batch/day, must not wait for tomorrow ---
+
+def test_flush_idle_does_nothing_before_threshold():
+    out = []
+    strat = BatchCounter()
+    clock = {"t": 0.0}
+    runner = StrategistRunner([Sleeve("mom", strat, "day", FakeView())], out.append,
+                              clock=lambda: clock["t"])
+    runner.on_bar(_bar(1, "A"))
+    runner.on_bar(_bar(1, "B"))
+    assert runner.flush_idle(idle_seconds=60.0) == 0
+    assert out == []
+
+
+def test_flush_idle_flushes_a_stale_batch():
+    out = []
+    strat = BatchCounter()
+    clock = {"t": 0.0}
+    runner = StrategistRunner([Sleeve("mom", strat, "day", FakeView())], out.append,
+                              clock=lambda: clock["t"])
+    runner.on_bar(_bar(1, "A"))
+    runner.on_bar(_bar(1, "B"))
+    clock["t"] = 91.0   # past the 90s idle window with no new bars
+    assert runner.flush_idle(idle_seconds=90.0) == 1
+    assert strat.batches == [["A", "B"]]
+    assert len(out) == 1
+
+
+def test_flush_idle_is_a_noop_with_no_pending_batch():
+    out = []
+    runner = StrategistRunner([Sleeve("mom", BatchCounter(), "day", FakeView())], out.append)
+    assert runner.flush_idle(idle_seconds=0.0) == 0

@@ -119,9 +119,11 @@ class Settings(BaseSettings):
     reader_intervals: list[str] = Field(default_factory=lambda: ["day"])
     # how far back each scheduled pull reaches; overlap is safe (upserts are idempotent)
     reader_lookback_minutes: int = 90
-    # Day mode: one pull after the close (partial-candle guard blocks earlier runs
-    # anyway); hourly legacy value was "5 * * * *".
-    reader_schedule_cron: str = "45 15 * * *"
+    # Day mode: poll every 10 minutes; the day-mode session window (15:45-23:00 IST)
+    # gates when work actually happens, so this is cheap no-ops the rest of the day.
+    # Deliberately NOT a single precise "45 15 * * *" shot — that has no retry if one
+    # invocation is missed or fails, silently losing the whole day's swing-sleeve feed.
+    reader_schedule_cron: str = "*/10 * * * *"
     # how often to re-check for a fresh token after a token_expired alert
     reader_token_poll_seconds: float = 30.0
 

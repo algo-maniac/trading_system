@@ -102,3 +102,82 @@ def test_cycle_pauses_and_alerts_on_token_expiry(bus):
     r = s.run_cycle(now=datetime(2024, 1, 2, 10, 5, tzinfo=IST))
     assert r == {"status": "paused_no_token", "published": 0}
     assert "token_expired" in _alert_kinds(bus)
+
+
+def test_cycle_catches_unexpected_exception_and_retries_cleanly(bus):
+    """A non-auth failure (network/DB/etc.) must not crash the cycle — it should report
+    an error status so the next scheduled tick can retry, instead of the whole process
+    dying or the failure vanishing silently."""
+    def boom(*a, **k):
+        raise ConnectionError("kite api unreachable")
+
+    s = _scheduler(bus, ingest_fn=boom)
+    now = datetime(2024, 1, 2, 10, 5, tzinfo=IST)
+    r = s.run_cycle(now=now)
+    assert r["status"] == "error"
+    assert "kite api unreachable" in r["error"]
+    assert r["published"] == 0
+    # next tick (no code change needed) succeeds normally — proves retry-friendliness
+    s2 = _scheduler(bus)
+    s2._last_published = s._last_published  # same cursor state, simulating the same instance
+    r2 = s2.run_cycle(now=now)
+    assert r2["status"] == "ok"
+
+
+def test_day_mode_default_cron_is_frequent_not_single_shot():
+    """Guards the retry-friendliness fix: day-mode must poll often (window gate decides
+    WHEN to act), not fire once precisely at 15:45 with no second chance."""
+    from trading_system.config import get_settings
+    cron = get_settings().reader_schedule_cron
+    assert cron != "45 15 * * *", (
+        "a single once-a-day cron shot has no retry if that one invocation is missed "
+        "or fails — see agents/reader/scheduler.py ReaderScheduler.start() docstring"
+    )
+
+
+def test_day_mode_skips_repeat_ingest_after_success_same_day(bus):
+    """Once a day-mode cycle succeeds, later same-day ticks must not re-ingest the whole
+    universe every 10 minutes for the rest of the evening — wasteful Kite quota burn
+    for data that can no longer change post-close."""
+    calls = {"n": 0}
+
+    def counting_ingest(*a, **k):
+        calls["n"] += 1
+        return []
+
+    s = ReaderScheduler(
+        bus, TokenManager(alert_bus=bus),
+        symbols=["RELIANCE"], intervals=["day"], cron="*/10 * * * *",
+        ingest_fn=counting_ingest, read_bars_fn=_fake_bars,
+    )
+    now = datetime(2024, 1, 2, 16, 0, tzinfo=IST)   # in the day-mode window
+    r1 = s.run_cycle(now=now)
+    assert r1["status"] == "ok" and calls["n"] == 1
+    r2 = s.run_cycle(now=now.replace(minute=10))
+    assert r2["status"] == "already_done_today" and calls["n"] == 1  # no second ingest
+    # next trading day: resumes normally
+    tomorrow = datetime(2024, 1, 3, 16, 0, tzinfo=IST)
+    r3 = s.run_cycle(now=tomorrow)
+    assert r3["status"] == "ok" and calls["n"] == 2
+
+
+def test_day_mode_retries_after_a_failed_cycle(bus):
+    """A failure must NOT set the success guard — the next tick should retry."""
+    attempts = {"n": 0}
+
+    def flaky_ingest(*a, **k):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ConnectionError("transient")
+        return []
+
+    s = ReaderScheduler(
+        bus, TokenManager(alert_bus=bus),
+        symbols=["RELIANCE"], intervals=["day"], cron="*/10 * * * *",
+        ingest_fn=flaky_ingest, read_bars_fn=_fake_bars,
+    )
+    now = datetime(2024, 1, 2, 16, 0, tzinfo=IST)
+    r1 = s.run_cycle(now=now)
+    assert r1["status"] == "error"
+    r2 = s.run_cycle(now=now.replace(minute=10))
+    assert r2["status"] == "ok"  # retried and succeeded

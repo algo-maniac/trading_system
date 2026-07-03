@@ -19,7 +19,8 @@ Run as a container:  python -m trading_system.agents.reader.live_app
 import signal
 import sys
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from trading_system.agents.reader.aggregator import FiveMinResampler, TickAggregator
 from trading_system.agents.reader.live_features import latest_features
@@ -37,6 +38,21 @@ logger = get_logger(__name__)
 _MAX_FOCUS = 50
 _HISTORY_SESSIONS = 2   # prior sessions kept in the feature frame (warmup + gap_pct)
 _HISTORY_MAX_BARS = 75 * (_HISTORY_SESSIONS + 1)
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _tick_timestamp(tick: dict) -> datetime:  # type: ignore[type-arg]
+    """Kite's `exchange_timestamp` is a NAIVE datetime representing IST wall-clock time.
+    Attaching tzinfo (not converting to UTC) preserves the wall-clock hour/minute values
+    the aggregator's session-bucket math depends on (09:15 session open etc.) while
+    making the bar comparable against the tz-aware UTC timestamps day-bars carry
+    elsewhere in the system — mixing naive and aware datetimes in the same comparison
+    (as LivePortfolio.update_price does) raises TypeError and crashed the Trader the
+    first time a day-bar and an intraday bar met in the same process."""
+    raw = tick.get("exchange_timestamp")
+    if raw is None:
+        return datetime.now(_IST)
+    return raw.replace(tzinfo=_IST) if raw.tzinfo is None else raw
 
 
 def build_focus_universe(today: date) -> list[str]:
@@ -86,7 +102,7 @@ class LiveReader:
                     token=tick["instrument_token"],
                     ltp=float(tick.get("last_price") or 0.0),
                     cum_volume=int(tick.get("volume_traded") or 0),
-                    ts=tick.get("exchange_timestamp") or datetime.now(UTC),
+                    ts=_tick_timestamp(tick),
                 )
                 if minute_bar is not None:
                     self._on_minute_bar(minute_bar)

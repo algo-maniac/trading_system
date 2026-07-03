@@ -65,11 +65,16 @@ class TraderCore:
             ledger.ensure_sleeve(name, paper_capital * weight)
         # trailing-stop peaks: (sleeve, symbol) -> running peak price
         self._peaks: dict[tuple[str, str], float] = {}
+        # Liveness counters — see agents/heartbeat.py; a quiet Trader (no signals to
+        # gate) looks identical to a stuck one without these.
+        self.bars_processed = 0
+        self.signals_handled = 0
 
     # --- signal path ------------------------------------------------------------
 
     def on_signal(self, sig: SignalEvent) -> str:
         """Journal + gate + place. Returns the outcome for logging/tests."""
+        self.signals_handled += 1
         sleeve = self._sleeves.get(sig.sleeve)
         if sleeve is None:
             logger.warning("signal_unknown_sleeve", sleeve=sig.sleeve, sid=sig.id[:12])
@@ -104,6 +109,7 @@ class TraderCore:
     # --- bar path ----------------------------------------------------------------
 
     def on_bar(self, bar: BarEvent) -> None:
+        self.bars_processed += 1
         for view in self._views.values():
             view.update_price(bar.symbol, bar.close, bar.ts)
         fills = self._broker.on_bar(bar)  # type: ignore[attr-defined] — paper broker

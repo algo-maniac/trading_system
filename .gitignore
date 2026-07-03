@@ -16,8 +16,10 @@ venv/
 env/
 *.so
 
-# Data (can be large; archive separately)
-data/
+# Local raw-data archive (can be large; archive separately). Anchored to the repo
+# root (`/data/`) — a bare `data/` pattern also matches src/trading_system/data/,
+# which silently excluded that entire core package from every commit until caught.
+/data/
 *.parquet
 
 # Testing

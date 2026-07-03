@@ -101,11 +101,19 @@ class ReaderScheduler:
         self._read_bars_fn = read_bars_fn
         self._last_published: dict[tuple[str, str], datetime] = {}
         self._scheduler: object | None = None
+        self._day_mode = intervals == ["day"]
         # Day-interval mode: only publish after the close (partial-candle guard).
-        if intervals == ["day"]:
+        if self._day_mode:
             self._window = (_DAY_MODE_OPEN, _DAY_MODE_CLOSE)
         else:
             self._window = (_SESSION_OPEN, _SESSION_CLOSE)
+        # Day mode polls frequently for retry-safety (see start()), but day-bars are
+        # final once ingested post-close — re-fetching the full universe every 10
+        # minutes for the rest of the evening after a SUCCESSFUL cycle wastes Kite
+        # quota for no benefit. Track the last day this mode actually succeeded and
+        # skip repeat work once it has (a failure leaves this unset, so retries
+        # continue as intended).
+        self._last_succeeded_day: date | None = None
 
     def _in_session(self, now: datetime) -> bool:
         return self._window[0] <= now.time() <= self._window[1]
@@ -119,23 +127,35 @@ class ReaderScheduler:
         if not self._in_session(now):
             logger.info("reader_skip_off_hours", at=now.strftime("%H:%M"))
             return {"status": "skipped_off_hours", "published": 0}
+        if self._day_mode and self._last_succeeded_day == now.date():
+            return {"status": "already_done_today", "published": 0}
 
         day = now.date()
-        # ingest_universe raises AuthError at its top if today's token is missing → guard catches.
-        ingested = self.token_manager.guard(
-            lambda: self._ingest_fn(self.symbols, self.intervals, day, day, workers=self.workers)
-        )
-        if ingested is None:
-            return {"status": "paused_no_token", "published": 0}
+        try:
+            # ingest_universe raises AuthError at its top if today's token is missing →
+            # guard catches. Everything else (network, DB, feature-build) is caught below
+            # so ONE bad cycle can't silently vanish — the next scheduled tick retries.
+            ingested = self.token_manager.guard(
+                lambda: self._ingest_fn(
+                    self.symbols, self.intervals, day, day, workers=self.workers
+                )
+            )
+            if ingested is None:
+                return {"status": "paused_no_token", "published": 0}
 
-        if self.feature_version is not None:
-            bars = self._read_bars_fn(self.symbols, self.intervals, day, day,
-                                      feature_version=self.feature_version)
-        else:  # legacy call shape — keeps injected test fakes source-compatible
-            bars = self._read_bars_fn(self.symbols, self.intervals, day, day)
-        published = self._publish_new(bars)
-        logger.info("reader_cycle_done", date=str(day), published=published)
-        return {"status": "ok", "published": published}
+            if self.feature_version is not None:
+                bars = self._read_bars_fn(self.symbols, self.intervals, day, day,
+                                          feature_version=self.feature_version)
+            else:  # legacy call shape — keeps injected test fakes source-compatible
+                bars = self._read_bars_fn(self.symbols, self.intervals, day, day)
+            published = self._publish_new(bars)
+            logger.info("reader_cycle_done", date=str(day), published=published)
+            if self._day_mode:
+                self._last_succeeded_day = day
+            return {"status": "ok", "published": published}
+        except Exception as exc:
+            logger.error("reader_cycle_failed", date=str(day), error=str(exc), exc_info=True)
+            return {"status": "error", "published": 0, "error": str(exc)}
 
     def _publish_new(self, bars: list[BarEvent]) -> int:
         """Publish bars newer than the last one seen for their (symbol, interval) — no dups."""
@@ -151,18 +171,41 @@ class ReaderScheduler:
         return count
 
     def start(self) -> None:
-        """Start the background hourly job.
+        """Start the background job on `self.cron`.
+
+        A single precise once-a-day cron shot has no retry: if that one invocation is
+        missed (scheduler hiccup) or fails (Kite blip), the day's data is silently lost.
+        `_publish_new`'s per-(symbol,interval) cursor makes repeat invocations after a
+        success a cheap no-op (0 new bars), so day-mode's cron is intentionally frequent
+        (`config.reader_schedule_cron` default "*/10 * * * *") — the `_in_session` window
+        gate (15:45-23:00 for day mode) decides WHEN work actually happens, same pattern
+        as the original hourly intraday reader. This is what makes a single missed tick
+        self-heal on the next one instead of losing the whole day.
+
+        An APScheduler listener surfaces job-level errors/misses through our own logger —
+        relying solely on APScheduler's internal stdlib-logging fallback isn't visible
+        enough (it's a separate logger namespace from the rest of the app).
 
         APScheduler is imported lazily so run_cycle stays unit-testable without it installed.
         """
+        from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
+
+        def _on_scheduler_event(event: object) -> None:
+            if getattr(event, "exception", None) is not None:
+                logger.error("reader_scheduler_job_error", exception=str(event.exception))
+            else:
+                logger.warning("reader_scheduler_job_missed", scheduled_run_time=str(
+                    getattr(event, "scheduled_run_time", None)
+                ))
 
         sched = BackgroundScheduler(timezone=IST)
         sched.add_job(
             self.run_cycle, CronTrigger.from_crontab(self.cron, timezone=IST),
-            id="reader_cycle", max_instances=1, coalesce=True,
+            id="reader_cycle", max_instances=1, coalesce=True, misfire_grace_time=None,
         )
+        sched.add_listener(_on_scheduler_event, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
         sched.start()
         self._scheduler = sched
         logger.info("reader_scheduler_started", cron=self.cron, intervals=self.intervals)
