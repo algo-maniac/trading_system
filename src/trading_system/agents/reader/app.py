@@ -23,12 +23,17 @@ def build_scheduler() -> ReaderScheduler:
     s = get_settings()
     bus = RedisBarBus()
     token_manager = TokenManager(alert_bus=bus)
+    day_mode = s.reader_intervals == ["day"]
     return ReaderScheduler(
         bus, token_manager,
-        symbols=s.liquid_symbols,
+        # Day mode = the swing sleeves' EOD path: full 200-name universe, bars published
+        # WITH v3 features (sma/rsi gates never fire on empty features). Intraday-interval
+        # mode keeps the legacy liquid subset (superseded by live_app's WebSocket plane).
+        symbols=s.nifty_200_symbols if day_mode else s.liquid_symbols,
         intervals=s.reader_intervals,
         cron=s.reader_schedule_cron,
         workers=s.ingest_workers,
+        feature_version="v3" if day_mode else None,
     )
 
 

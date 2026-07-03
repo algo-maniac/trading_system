@@ -114,11 +114,14 @@ class Settings(BaseSettings):
     nifty_200_symbols: list[str] = Field(default_factory=lambda: NIFTY_200_SYMBOLS)
 
     # Reader agent (scheduled incremental ingestion)
-    reader_intervals: list[str] = Field(default_factory=lambda: ["5minute", "minute"])
+    # Default = the swing sleeves' EOD day-bar path (Nifty 200 + v3 features, publishes
+    # after close). Intraday 5-min data comes from the WebSocket live_app, not this.
+    reader_intervals: list[str] = Field(default_factory=lambda: ["day"])
     # how far back each scheduled pull reaches; overlap is safe (upserts are idempotent)
     reader_lookback_minutes: int = 90
-    # hourly at :05, gated further to NSE session hours by the calendar
-    reader_schedule_cron: str = "5 * * * *"
+    # Day mode: one pull after the close (partial-candle guard blocks earlier runs
+    # anyway); hourly legacy value was "5 * * * *".
+    reader_schedule_cron: str = "45 15 * * *"
     # how often to re-check for a fresh token after a token_expired alert
     reader_token_poll_seconds: float = 30.0
 

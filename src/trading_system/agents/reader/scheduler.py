@@ -27,14 +27,36 @@ logger = get_logger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 _SESSION_OPEN = time(9, 0)    # coarse gate (real session 09:15); allows a :05 pull buffer
 _SESSION_CLOSE = time(15, 40)  # a little past the 15:30 close to catch the final bars
+# Day-interval mode publishes ONLY after the close: Kite returns a running (partial)
+# day candle during the session, and publishing it would fire swing signals on
+# incomplete data. The gate opens after square-off/close and stays open into the
+# evening so a late `trading auth` still lets the cycle run.
+_DAY_MODE_OPEN = time(15, 45)
+_DAY_MODE_CLOSE = time(23, 0)
 
 
 def read_bars_for_window(
-    symbols: list[str], intervals: list[str], from_date: date, to_date: date
+    symbols: list[str], intervals: list[str], from_date: date, to_date: date,
+    feature_version: str | None = None,
 ) -> list[BarEvent]:
-    """Read OHLCV bars for the window from the DB as BarEvents (features empty — see app.py note).
+    """Read OHLCV bars for the window from the DB as BarEvents.
+
+    With `feature_version` set, bars come via ReplayEngine and CARRY that feature set
+    (required for the strategist's swing sleeves — sma/rsi gates never fire on empty
+    features). Without it, raw OHLCV with empty features (legacy behavior).
     Sorted by (ts, symbol) to match the engine's expected ordering."""
-    bars: list[BarEvent] = []
+    if feature_version is not None:
+        from trading_system.replay.engine import ReplayEngine
+        with get_connection() as conn:
+            token_map = get_symbol_token_map(conn, symbols)
+        bars = []
+        for interval in intervals:
+            bars.extend(ReplayEngine(
+                symbols, token_map, interval, from_date, to_date, feature_version
+            ).run())
+        bars.sort()
+        return bars
+    bars = []
     with get_connection() as conn:
         token_map = get_symbol_token_map(conn, symbols)
         for symbol in symbols:
@@ -64,6 +86,7 @@ class ReaderScheduler:
         intervals: list[str],
         cron: str,
         workers: int = 5,
+        feature_version: str | None = None,
         ingest_fn: Callable[..., list] = ingest_universe,
         read_bars_fn: Callable[..., list[BarEvent]] = read_bars_for_window,
     ) -> None:
@@ -73,14 +96,19 @@ class ReaderScheduler:
         self.intervals = intervals
         self.cron = cron
         self.workers = workers
+        self.feature_version = feature_version
         self._ingest_fn = ingest_fn
         self._read_bars_fn = read_bars_fn
         self._last_published: dict[tuple[str, str], datetime] = {}
         self._scheduler: object | None = None
+        # Day-interval mode: only publish after the close (partial-candle guard).
+        if intervals == ["day"]:
+            self._window = (_DAY_MODE_OPEN, _DAY_MODE_CLOSE)
+        else:
+            self._window = (_SESSION_OPEN, _SESSION_CLOSE)
 
-    @staticmethod
-    def _in_session(now: datetime) -> bool:
-        return _SESSION_OPEN <= now.time() <= _SESSION_CLOSE
+    def _in_session(self, now: datetime) -> bool:
+        return self._window[0] <= now.time() <= self._window[1]
 
     def run_cycle(self, now: datetime | None = None) -> dict:
         """One ingest+publish cycle. Returns a small status dict (also used by tests)."""
@@ -100,7 +128,11 @@ class ReaderScheduler:
         if ingested is None:
             return {"status": "paused_no_token", "published": 0}
 
-        bars = self._read_bars_fn(self.symbols, self.intervals, day, day)
+        if self.feature_version is not None:
+            bars = self._read_bars_fn(self.symbols, self.intervals, day, day,
+                                      feature_version=self.feature_version)
+        else:  # legacy call shape — keeps injected test fakes source-compatible
+            bars = self._read_bars_fn(self.symbols, self.intervals, day, day)
         published = self._publish_new(bars)
         logger.info("reader_cycle_done", date=str(day), published=published)
         return {"status": "ok", "published": published}
