@@ -56,16 +56,30 @@ def _tick_timestamp(tick: dict) -> datetime:  # type: ignore[type-arg]
 
 
 def build_focus_universe(today: date) -> list[str]:
-    """Intraday focus list: rolling volatile screen ∪ liquid names, capped.
+    """Intraday focus list for today.
 
-    (Phase 5c adds the filings gap-watchlist and the pre-open quote scan as further
-    sources; the union/cap contract stays the same.)
+    Primary source: the Analyst's persisted `focus_list` (news ∪ gap-watch ∪ screen ∪
+    liquid ∪ held, already prioritized and capped). Fallback when the Analyst hasn't
+    run (or is down): the pre-5c inline computation — an unavailable news layer must
+    degrade coverage quality, never blind the system. Either way, open positions from
+    the ledger are unioned in defensively: an exit must never lose its data feed.
     """
+    from trading_system.data.news_store import read_focus_list
+    from trading_system.execution.ledger import PostgresLedger
+
     s = get_settings()
     with get_connection() as conn:
-        screened = volatile_universe(conn, s.nifty_200_symbols, today)
-    focus = list(dict.fromkeys(screened + s.liquid_symbols))  # ordered de-dupe
-    return focus[:_MAX_FOCUS]
+        focus = read_focus_list(conn, today)
+        if focus:
+            logger.info("focus_from_analyst", n=len(focus))
+        else:
+            logger.warning("focus_fallback_inline", reason="no focus_list row for today")
+            focus = list(dict.fromkeys(
+                volatile_universe(conn, s.nifty_200_symbols, today) + s.liquid_symbols
+            ))
+        held = sorted({p.symbol for p in PostgresLedger(conn).open_positions()})
+    ordered = list(dict.fromkeys(held + focus))   # held first → survives the cap
+    return ordered[:_MAX_FOCUS]
 
 
 class LiveReader:

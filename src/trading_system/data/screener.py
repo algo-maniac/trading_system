@@ -51,6 +51,47 @@ def rank_by_range(
     return [r.symbol for r in eligible[:top_n]]
 
 
+def symbol_quant_stats(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    symbol: str,
+    as_of: date,
+    lookback_days: int = 90,
+) -> ScreenRow | None:
+    """One symbol's screen stats (admission pipeline's quant-gate input). None = no data."""
+    since = as_of - timedelta(days=lookback_days)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT avg((o.high - o.low) / nullif(o.close, 0)),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY o.close * o.volume),
+                   count(*)
+            FROM ohlcv o JOIN instruments i USING (instrument_token)
+            WHERE o.interval = 'day' AND i.tradingsymbol = %s
+              AND o.ts >= %s AND o.ts < %s
+            """,
+            (symbol, since, as_of),
+        )
+        row = cur.fetchone()
+    if row is None or row[2] == 0:
+        return None
+    return ScreenRow(symbol=symbol, avg_range_pct=float(row[0] or 0.0),
+                     median_turnover=float(row[1] or 0.0), sessions=int(row[2]))
+
+
+def total_day_sessions(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    symbol: str,
+) -> int:
+    """Total day-bar sessions stored for a symbol (admission history-length gate)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM ohlcv o JOIN instruments i USING (instrument_token) "
+            "WHERE o.interval='day' AND i.tradingsymbol=%s",
+            (symbol,),
+        )
+        return int(cur.fetchone()[0])
+
+
 def volatile_universe(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     pool: list[str],

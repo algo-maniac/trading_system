@@ -114,6 +114,22 @@ services:
         condition: service_healthy
     command: ["python", "-m", "trading_system.agents.trader.app"]
 
+  # Phase 5c: daily market-analysis brain — news sweeps (StockInsights), universe
+  # admissions (backfill → quant gates → LLM review), focus-list construction.
+  analyst:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.analyst.app"]
+
 volumes:
   timescaledb_data:
   redis_data:

@@ -87,12 +87,16 @@ class ReaderScheduler:
         cron: str,
         workers: int = 5,
         feature_version: str | None = None,
+        symbols_fn: Callable[[], list[str]] | None = None,
         ingest_fn: Callable[..., list] = ingest_universe,
         read_bars_fn: Callable[..., list[BarEvent]] = read_bars_for_window,
     ) -> None:
         self.bus = bus
         self.token_manager = token_manager
         self.symbols = symbols
+        # Optional dynamic universe: re-resolved at every cycle start (Phase 5c — the
+        # tradable set grows with news admissions and must include held names).
+        self._symbols_fn = symbols_fn
         self.intervals = intervals
         self.cron = cron
         self.workers = workers
@@ -129,6 +133,12 @@ class ReaderScheduler:
             return {"status": "skipped_off_hours", "published": 0}
         if self._day_mode and self._last_succeeded_day == now.date():
             return {"status": "already_done_today", "published": 0}
+
+        if self._symbols_fn is not None:
+            try:
+                self.symbols = self._symbols_fn()
+            except Exception as exc:  # dynamic-universe failure → keep last-known set
+                logger.error("reader_symbols_fn_failed", error=str(exc))
 
         day = now.date()
         try:

@@ -19,6 +19,20 @@ from trading_system.observability import get_logger, setup_logging
 logger = get_logger(__name__)
 
 
+def _day_universe() -> list[str]:
+    """Swing universe, resolved fresh per cycle: Nifty 200 ∪ news-admitted members ∪
+    held positions (an exit must always have a data feed)."""
+    from trading_system.data.news_store import active_universe_members
+    from trading_system.data.storage import get_connection
+    from trading_system.execution.ledger import PostgresLedger
+
+    s = get_settings()
+    with get_connection() as conn:
+        admitted = active_universe_members(conn)
+        held = sorted({p.symbol for p in PostgresLedger(conn).open_positions()})
+    return list(dict.fromkeys(list(s.nifty_200_symbols) + admitted + held))
+
+
 def build_scheduler() -> ReaderScheduler:
     s = get_settings()
     bus = RedisBarBus()
@@ -26,14 +40,15 @@ def build_scheduler() -> ReaderScheduler:
     day_mode = s.reader_intervals == ["day"]
     return ReaderScheduler(
         bus, token_manager,
-        # Day mode = the swing sleeves' EOD path: full 200-name universe, bars published
-        # WITH v3 features (sma/rsi gates never fire on empty features). Intraday-interval
-        # mode keeps the legacy liquid subset (superseded by live_app's WebSocket plane).
+        # Day mode = the swing sleeves' EOD path: dynamic universe (N200 ∪ admitted ∪
+        # held) with v3 features attached. Intraday-interval mode keeps the legacy
+        # liquid subset (superseded by live_app's WebSocket plane).
         symbols=s.nifty_200_symbols if day_mode else s.liquid_symbols,
         intervals=s.reader_intervals,
         cron=s.reader_schedule_cron,
         workers=s.ingest_workers,
         feature_version="v3" if day_mode else None,
+        symbols_fn=_day_universe if day_mode else None,
     )
 
 

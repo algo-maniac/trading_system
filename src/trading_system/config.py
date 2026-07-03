@@ -152,6 +152,20 @@ class Settings(BaseSettings):
     backtest_initial_capital: float = 1_000_000.0   # ₹10 lakh
     backtest_slippage_bps: float = 5.0              # basis points, adverse to fill direction
 
+    # --- Phase 5c: news-driven analysis (Analyst agent) ---
+    stockinsights_api_key: str = ""
+    # Zuplo-gateway host (per docs; matches the zpka_ key prefix), env-overridable in
+    # case StockInsights moves to a vanity domain later.
+    stockinsights_base_url: str = "https://stockinsights-ai-main-95a26a0.zuplo.app"
+    stockinsights_daily_budget: int = 100   # trial quota unknown → conservative cap
+    stockinsights_rps: float = 1.0          # politeness limit, not a documented cap
+    llm_provider: str = "mock"              # "mock" until the Claude API plan is purchased
+    llm_daily_call_budget: int = 100
+    admission_max_new_per_day: int = 10     # caps Kite backfill burst from news names
+    # Analyst sweep schedule (IST): evening filings sweeps + pre-open sweep; the focus
+    # build runs as part of the 08:15 sweep (after it, same cycle).
+    analyst_sweep_cron: str = "15 8,18,21 * * *"
+
 
 _settings: Settings | None = None
 
