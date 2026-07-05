@@ -1,0 +1,60 @@
+# Replay namespace (Phase 5d'): paper-trade the PAST at accelerated speed.
+#
+# Same image, same agent binaries as live — isolation is pure env:
+#   DATABASE_URL -> trading_replay   (clone of trading_db; reset via scripts/replay_reset.sh)
+#   REDIS_URL    -> redis db 1       (own streams, consumer groups, budgets)
+# The stack joins the LIVE compose network to reach the shared timescaledb/redis
+# containers; nothing here touches trading_db or redis db 0.
+#
+# Run order matters — consumers first (fresh consumer groups start at stream tail):
+#   scripts/replay_reset.sh
+#   docker compose -f docker-compose.replay.yml up -d strategist trader reporter
+#   docker compose -f docker-compose.replay.yml run --rm replayer \
+#       --from 2025-01-01 --to 2025-04-03 --intervals day
+name: trading-replay
+
+x-replay-env: &replay-env
+  DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_replay
+  REDIS_URL: redis://redis:6379/1
+  NAMESPACE: replay
+  REPLAY_MODE: "true"
+  LLM_PROVIDER: mock                # never burn API credit in replay by default
+  STRATEGIST_FLUSH_IDLE_SECONDS: "2"
+  REPORTER_POLL_SECONDS: "2"
+  REPORTS_DIR: /app/reports
+
+services:
+  strategist:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment: *replay-env
+    command: ["python", "-m", "trading_system.agents.strategist.app"]
+
+  trader:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment: *replay-env
+    command: ["python", "-m", "trading_system.agents.trader.app"]
+
+  reporter:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment: *replay-env
+    volumes:
+      - ./reports:/app/reports
+    command: ["python", "-m", "trading_system.agents.reporter.app"]
+
+  replayer:
+    image: trading-system:latest
+    restart: "no"
+    env_file: .env
+    environment: *replay-env
+    entrypoint: ["python", "-m", "trading_system.agents.replayer.app"]
+
+networks:
+  default:
+    external: true
+    name: trading_system_default

@@ -33,7 +33,15 @@ _FOCUS_BUILD_BEFORE = time(12, 0)  # a sweep before noon also (re)builds today's
 
 def build_core(conn) -> AnalystCore:
     s = get_settings()
-    client = StockInsightsClient()
+    if s.replay_mode:
+        # Replay namespace: smaller news budget (the PHYSICAL StockInsights quota is
+        # shared with live — only the Redis counter is namespaced) and no Kite
+        # backfill mid-replay (candidates are judged on already-stored history).
+        from trading_system.net.limits import DailyBudget
+        client = StockInsightsClient(
+            budget=DailyBudget("stockinsights", s.replay_news_budget))
+    else:
+        client = StockInsightsClient()
     ledger = PostgresLedger(conn)
     bus = RedisBarBus()
 
@@ -44,6 +52,9 @@ def build_core(conn) -> AnalystCore:
             return {r[0] for r in cur.fetchall()}
 
     def backfill(symbols: list[str]) -> None:
+        if s.replay_mode:
+            logger.info("admission_backfill_skipped_replay", symbols=symbols)
+            return
         two_years_ago = date.today() - timedelta(days=730)
         logger.info("admission_backfill", symbols=symbols)
         ingest_universe(symbols, ["day"], two_years_ago, date.today(), workers=2)
