@@ -1,7 +1,7 @@
 """LLM clients behind a swappable protocol.
 
 `llm_provider` in settings picks the implementation: "mock" (deterministic heuristics,
-free, the default until the Claude API plan is purchased) or "anthropic" (stubbed).
+free — the replay default) or "anthropic" (real Claude Haiku reviews, budget-guarded).
 Everything downstream talks to the LLMClient protocol only.
 """
 from trading_system.config import get_settings

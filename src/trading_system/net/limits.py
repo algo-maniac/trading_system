@@ -52,3 +52,53 @@ class DailyBudget:
             self._r.decrby(key, n)  # refund — the work will not happen
             logger.warning("budget_exhausted", api=self._api, cap=self._cap)
             raise BudgetExhausted(self._api, self._cap)
+
+
+_SPEND_TTL_SECONDS = 40 * 86_400  # a month key outlives its month by ~10 days for ops
+_MICRO = 1_000_000                # store integer micro-dollars — no float drift in Redis
+
+
+class MonthlySpend:
+    """Cumulative monthly USD spend tracker for a metered API (the LLM).
+
+    Unlike DailyBudget (call counts, known before the call), real cost is only known
+    AFTER a call returns (from response.usage). So the contract is:
+      precheck()  — BEFORE the call: raise BudgetExhausted once the month's total has
+                    reached the cap. One in-flight call can overshoot by its own cost
+                    (~$0.003 for a Haiku review) — accepted, keeps the hot path simple.
+      add_usd()   — AFTER the call: record the actual cost; returns the new total.
+      crossed_alert_threshold() — True exactly once per month (SETNX flag) when the
+                    total passes the alert line, so the caller raises one bus alert,
+                    not one per call.
+    """
+
+    def __init__(self, api: str, cap_usd: float, alert_usd: float = 0.0,
+                 client: "redis.Redis | None" = None) -> None:
+        self._api = api
+        self._cap_usd = cap_usd
+        self._alert_usd = alert_usd
+        self._r = client or redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+
+    def _key(self) -> str:
+        return f"spend:{self._api}:{datetime.now(_IST).strftime('%Y-%m')}"
+
+    def total_usd(self) -> float:
+        value = self._r.get(self._key())
+        return (int(value) if value else 0) / _MICRO
+
+    def precheck(self) -> None:
+        if self.total_usd() >= self._cap_usd:
+            logger.warning("spend_cap_reached", api=self._api, cap_usd=self._cap_usd)
+            raise BudgetExhausted(self._api, int(self._cap_usd))
+
+    def add_usd(self, cost_usd: float) -> float:
+        key = self._key()
+        new_total = int(self._r.incrby(key, max(0, round(cost_usd * _MICRO))))
+        self._r.expire(key, _SPEND_TTL_SECONDS)
+        return new_total / _MICRO
+
+    def crossed_alert_threshold(self, total_usd: float) -> bool:
+        if self._alert_usd <= 0 or total_usd < self._alert_usd:
+            return False
+        # SETNX flag: only the call that first crosses the line gets True.
+        return bool(self._r.set(f"{self._key()}:alerted", "1", nx=True, ex=_SPEND_TTL_SECONDS))

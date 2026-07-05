@@ -159,12 +159,40 @@ class Settings(BaseSettings):
     stockinsights_base_url: str = "https://stockinsights-ai-main-95a26a0.zuplo.app"
     stockinsights_daily_budget: int = 100   # trial quota unknown → conservative cap
     stockinsights_rps: float = 1.0          # politeness limit, not a documented cap
-    llm_provider: str = "mock"              # "mock" until the Claude API plan is purchased
+    llm_provider: str = "mock"              # "mock" | "anthropic"
     llm_daily_call_budget: int = 100
+    # --- Phase 5d': real Anthropic client + spend controls ---
+    # $5 credit plan: live namespace is hard-capped at $2/month cumulative (alert at
+    # $1.50) so >$3 stays available for the user's own manual testing. Haiku only —
+    # an admission review costs ~$0.0025, so even the cap is ~800 reviews.
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-haiku-4-5"
+    llm_max_output_tokens: int = 512
+    llm_monthly_usd_cap: float = 2.0
+    llm_spend_alert_usd: float = 1.5
     admission_max_new_per_day: int = 10     # caps Kite backfill burst from news names
     # Analyst sweep schedule (IST): evening filings sweeps + pre-open sweep; the focus
     # build runs as part of the 08:15 sweep (after it, same cycle).
     analyst_sweep_cron: str = "15 8,18,21 * * *"
+
+    # --- Phase 5d': namespaces, replay harness, reporter ---
+    # "live" or "replay" — selects report output paths and log context. The replay
+    # namespace is otherwise isolated purely by DATABASE_URL (trading_replay) and
+    # REDIS_URL (redis db 1) in docker-compose.replay.yml.
+    namespace: str = "live"
+    # Replay mode (analyst): news-discovered symbols are judged on already-stored
+    # history only — no Kite backfill calls mid-replay — and the StockInsights sweep
+    # runs under the smaller replay_news_budget.
+    replay_mode: bool = False
+    replay_day_delay_seconds: float = 4.0        # pause between simulated sessions
+    replay_intraday_delay_seconds: float = 0.05  # pause between 5-min timestamp groups
+    replay_news_budget: int = 30                 # StockInsights calls/day in replay
+    # Cross-sectional day-mode batches flush after this much bar-silence (live: the
+    # EOD reader publishes ~200 bars in a burst, 90s safely clears it; replay: bars
+    # arrive instantly, so the replay compose drops this to 2s to keep runs fast).
+    strategist_flush_idle_seconds: float = 90.0
+    reporter_poll_seconds: float = 60.0
+    reports_dir: Path = Path("./reports")
 
 
 _settings: Settings | None = None
