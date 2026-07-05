@@ -923,6 +923,47 @@ def backtests(limit: int = typer.Option(20, "--limit")) -> None:
     console.print(table)
 
 
+@app.command("report")
+def report(
+    period: str = typer.Option("daily", "--period", help="daily | weekly | monthly"),
+    for_date: str = typer.Option(None, "--date", help="Any date inside the period (default: today)"),
+    force: bool = typer.Option(False, "--force", help="Regenerate even if already reported"),
+) -> None:
+    """Generate (or regenerate) one performance report on demand and print it.
+
+    The reporter agent generates these automatically once the NEXT period's data
+    exists; --force lets you inspect a still-open period (e.g. today) early.
+    """
+    from datetime import date as _dateclass
+
+    from trading_system.agents.reporter import repo
+    from trading_system.agents.reporter.app import build_core, write_report_file
+    from trading_system.agents.reporter.core import period_for
+    from trading_system.data.storage import get_connection
+
+    if period not in ("daily", "weekly", "monthly"):
+        console.print("[red]--period must be daily, weekly or monthly[/]")
+        raise typer.Exit(code=1)
+    d = _date(for_date) if for_date else _dateclass.today()
+    p = period_for(period, d)
+
+    with get_connection() as conn:
+        if not force and (period, p.start) in repo.reported_periods(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT markdown FROM reports WHERE period_type=%s AND period_start=%s",
+                            (period, p.start))
+                row = cur.fetchone()
+            console.print(row[0] if row else "[red]report row missing[/]")
+            return
+        core = build_core(conn)
+        payload, markdown = core.build_report(p)
+        repo.insert_report(conn, p, payload, markdown, force=force)
+        path = write_report_file(markdown, p)
+
+    console.print(markdown)
+    console.print(f"[dim]written: {path}[/]")
+
+
 @app.command("backtest-report")
 def backtest_report(run_id: int = typer.Argument(..., help="Backtest run ID")) -> None:
     """Show full metrics for a stored backtest run."""
