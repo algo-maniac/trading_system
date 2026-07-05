@@ -157,3 +157,24 @@ def test_admission_skips_names_already_in_base_universe():
     core = AnalystCore(rec.deps(base_universe=lambda: ["NESTLEIND"]))
     assert core.consider_admissions([_item("NESTLEIND")], TODAY) == []
     assert rec.admitted == []
+
+
+def test_admission_backfill_failure_skips_candidates_not_cycle():
+    """Caught live (Phase 5d'): AuthError from a token-less Kite backfill crashed the
+    whole analyst cycle. Backfill must be best-effort: unbackfilled names fail the
+    history gate individually; other candidates still get reviewed."""
+    rec = Recorder(sessions=300)
+    short_history = {"FRESHCO"}
+
+    def sessions_for(sym):
+        return 100 if sym in short_history else 300
+
+    def broken_backfill(syms):
+        raise RuntimeError("No Kite access token found for today.")
+
+    deps = rec.deps(backfill_history=broken_backfill, total_sessions=sessions_for)
+    core = AnalystCore(deps)
+    admitted = core.consider_admissions(
+        [_item("FRESHCO"), _item("SEASONED", link="https://x/seasoned")], TODAY)
+    assert admitted == ["SEASONED"]          # the seasoned name still got through
+    assert "admission_backfill_failed" in rec.alerts

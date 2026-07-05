@@ -131,3 +131,49 @@ def test_snapshot_writes_equity_rows():
     core.snapshot(datetime(2026, 7, 2, 15, 30, tzinfo=_UTC))
     assert len(ledger.equity_snapshots) == 1
     assert ledger.equity_snapshots[0]["equity"] == pytest.approx(1_000_000)
+
+
+def test_data_driven_snapshot_on_session_boundary():
+    """First bar of a NEW IST session snapshots the PREVIOUS session's last bar ts —
+    the replay path where wall-clock gating never fires (Phase 5d')."""
+    core, ledger = _core()
+    core.on_bar(_bar_at(2, 9, 30, o=2000.0))
+    core.on_bar(_bar_at(2, 10, 0, o=2010.0))     # same session — no snapshot
+    assert ledger.equity_snapshots == []
+    core.on_bar(_bar_at(3, 9, 30, o=2020.0))     # new session → snapshot at day-2 last ts
+    assert len(ledger.equity_snapshots) == 1
+    assert ledger.equity_snapshots[0]["ts"] == datetime(2026, 7, 2, 10, 0, tzinfo=_UTC)
+    core.on_bar(_bar_at(4, 9, 30, o=2030.0))     # next boundary → one more
+    assert len(ledger.equity_snapshots) == 2
+
+
+def test_session_boundary_uses_ist_dates_for_day_bars():
+    """A day-bar stored at 18:30 UTC (= IST midnight of the NEXT calendar day) must
+    group with that next session, not with the UTC calendar date it sits on."""
+    from trading_system.replay.events import BarEvent
+
+    core, ledger = _core()
+    # Session D day-bar: stored 18:30 UTC on D-1 (= 00:00 IST on D)
+    day_bar_d = BarEvent(
+        ts=datetime(2026, 7, 1, 18, 30, tzinfo=_UTC), symbol="RELIANCE", interval="day",
+        instrument_token=1, open=2000.0, high=2000.0, low=2000.0, close=2000.0,
+        volume=1, features={},
+    )
+    # 5-min bar later in the SAME session D (July 2 IST, 09:30 IST = 04:00 UTC)
+    intraday_same_session = BarEvent(
+        ts=datetime(2026, 7, 2, 4, 0, tzinfo=_UTC), symbol="RELIANCE", interval="5minute",
+        instrument_token=1, open=2001.0, high=2001.0, low=2001.0, close=2001.0,
+        volume=1, features={},
+    )
+    core.on_bar(day_bar_d)
+    core.on_bar(intraday_same_session)           # same IST session — NO snapshot
+    assert ledger.equity_snapshots == []
+    # Next session's day-bar (18:30 UTC July 2 = 00:00 IST July 3) → boundary fires
+    day_bar_next = BarEvent(
+        ts=datetime(2026, 7, 2, 18, 30, tzinfo=_UTC), symbol="RELIANCE", interval="day",
+        instrument_token=1, open=2002.0, high=2002.0, low=2002.0, close=2002.0,
+        volume=1, features={},
+    )
+    core.on_bar(day_bar_next)
+    assert len(ledger.equity_snapshots) == 1
+    assert ledger.equity_snapshots[0]["ts"] == datetime(2026, 7, 2, 4, 0, tzinfo=_UTC)

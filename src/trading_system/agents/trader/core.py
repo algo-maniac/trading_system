@@ -21,6 +21,7 @@ double-fire; a pending SELL for a (sleeve, symbol) blocks further protective SEL
 """
 from dataclasses import dataclass, field
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from trading_system.bus.signals import SignalEvent, signal_id
 from trading_system.execution.broker import Broker, OrderRequest
@@ -36,6 +37,7 @@ from trading_system.strategy.signals import Side, Signal
 logger = get_logger(__name__)
 
 _MIS_SQUARE_OFF = time(15, 15)
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass
@@ -65,6 +67,9 @@ class TraderCore:
             ledger.ensure_sleeve(name, paper_capital * weight)
         # trailing-stop peaks: (sleeve, symbol) -> running peak price
         self._peaks: dict[tuple[str, str], float] = {}
+        # Last bar seen — drives the data-driven EOD snapshot (see on_bar). Wall-clock
+        # snapshots alone break in replay, where months of bar-time pass in minutes.
+        self._last_bar_ts: datetime | None = None
         # Liveness counters — see agents/heartbeat.py; a quiet Trader (no signals to
         # gate) looks identical to a stuck one without these.
         self.bars_processed = 0
@@ -108,8 +113,24 @@ class TraderCore:
 
     # --- bar path ----------------------------------------------------------------
 
+    @staticmethod
+    def _session_date(ts: datetime):
+        """IST calendar date of a bar's trading session. Day-bars are stored at IST
+        midnight (18:30 UTC of the previous calendar date), so converting to IST is
+        what groups a session's day-bar with its own 5-min bars — a raw .date() on
+        the UTC timestamp would put them a day apart."""
+        return ts.astimezone(_IST).date() if ts.tzinfo else ts.date()
+
     def on_bar(self, bar: BarEvent) -> None:
         self.bars_processed += 1
+        # Data-driven EOD snapshot: first bar of a NEW session closes the previous
+        # one — snapshot at the prior session's last bar ts BEFORE processing. This
+        # is what gives replay (where wall-clock gating never fires) one equity point
+        # per simulated day; live keeps its wall-clock snapshot too (upsert = safe).
+        if (self._last_bar_ts is not None
+                and self._session_date(bar.ts) > self._session_date(self._last_bar_ts)):
+            self.snapshot(self._last_bar_ts)
+        self._last_bar_ts = bar.ts
         for view in self._views.values():
             view.update_price(bar.symbol, bar.close, bar.ts)
         fills = self._broker.on_bar(bar)  # type: ignore[attr-defined] — paper broker

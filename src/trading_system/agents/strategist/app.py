@@ -34,7 +34,8 @@ SLEEVE_SPECS: list[tuple[str, str, dict, str]] = [
 
 
 def main() -> int:
-    setup_logging(get_settings().log_level)
+    s = get_settings()
+    setup_logging(s.log_level)
     # `with` (not get_connection().__enter__()) — the latter drops the context-manager
     # reference immediately, and CPython garbage-collecting it triggers __exit__ on the
     # generator, closing the connection within microseconds ("the connection is closed").
@@ -71,9 +72,10 @@ def main() -> int:
                 bar_bus.ack(GROUP, msg_id)
             # Day-mode gets exactly one batch/day — without this, a cross-sectional
             # sleeve's signals wait for TOMORROW's batch to trigger the flush, delaying
-            # every entry by a full trading day. 90s safely clears the reader's
-            # few-second all-symbols publish burst before treating a batch as complete.
-            runner.flush_idle(idle_seconds=90.0)
+            # every entry by a full trading day. Live default 90s safely clears the
+            # reader's few-second all-symbols publish burst; the replay namespace drops
+            # this to ~2s so accelerated runs don't wait 90s per simulated day.
+            runner.flush_idle(idle_seconds=s.strategist_flush_idle_seconds)
             # Alive-but-silent is the common case (most bars don't trigger a signal) —
             # without this, "quietly working" and "quietly stuck" look identical in logs.
             heartbeat.tick(

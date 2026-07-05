@@ -86,7 +86,11 @@ def main() -> int:
             )
             now = datetime.now(UTC)
             # IST session close ≈ 10:05 UTC; snapshot once after 10:05 UTC each weekday.
-            if now.time() >= time(10, 5) and last_snapshot_day != now.date():
+            # Live-only redundancy: in replay, bar-time and wall-time are unrelated —
+            # a wall-clock snapshot would stamp TODAY's date into a ledger replaying
+            # 2025, so the data-driven session-boundary snapshot (TraderCore.on_bar)
+            # is the only one that runs there.
+            if not s.replay_mode and now.time() >= time(10, 5) and last_snapshot_day != now.date():
                 core.snapshot(now)
                 last_snapshot_day = now.date()
         core.snapshot(datetime.now(UTC))

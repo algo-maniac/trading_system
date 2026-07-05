@@ -116,7 +116,16 @@ class AnalystCore:
         need_history = [c.nse_symbol for c in to_review
                         if self.d.total_sessions(c.nse_symbol) < _MIN_SESSIONS]  # type: ignore[arg-type]
         if need_history:
-            self.d.backfill_history(need_history)  # type: ignore[arg-type]
+            try:
+                self.d.backfill_history(need_history)  # type: ignore[arg-type]
+            except Exception as exc:
+                # Backfill is best-effort (caught live: a missing Kite token on a
+                # weekend sweep crashed the whole cycle here). Without fresh history
+                # these names simply fail the sessions gate below — fail CLOSED per
+                # candidate, never fail the cycle.
+                logger.error("admission_backfill_failed", symbols=need_history,
+                             error=str(exc))
+                self.d.alert("admission_backfill_failed", str(exc))
 
         for item in to_review:
             sym = item.nse_symbol
