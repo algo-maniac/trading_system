@@ -167,32 +167,82 @@ class LiveReader:
         logger.info("live_ws_subscribed", tokens=len(self._tokens))
 
 
-def main() -> int:
-    s = get_settings()
-    setup_logging(s.log_level)
-    today = date.today()
-    if not is_trading_day(today):
-        logger.info("live_reader_non_trading_day", date=str(today))
-        return 0
+# When idle (non-trading day / awaiting a token), re-check this often instead of
+# exiting — exiting under compose's `restart: unless-stopped` is a busy restart loop.
+_IDLE_RECHECK_SECONDS = 900.0
 
+
+def _ist_today() -> date:
+    """Trading-session date in IST — NOT date.today(), which returns the container's
+    UTC date and would call a late-evening IST session (still the same trading day)
+    a different, possibly non-trading, day."""
+    return datetime.now(_IST).date()
+
+
+def _run_session(s: object, kite: object, today: date, stop: threading.Event) -> None:
+    """Stream one trading day's ticks until shutdown or the IST day rolls over."""
     focus = build_focus_universe(today)
     with get_connection() as conn:
         token_map = get_symbol_token_map(conn, focus)
     reader = LiveReader(focus, token_map)
     reader.seed_history(today)
 
-    try:
-        kite = get_authenticated_kite()
-    except AuthError as exc:
-        RedisBarBus().publish_alert("token_expired", str(exc))
-        logger.error("live_reader_no_token")
-        return 1
-
     from kiteconnect import KiteTicker
-    ticker = KiteTicker(s.kite_api_key, kite.access_token)
+    ticker = KiteTicker(s.kite_api_key, kite.access_token)  # type: ignore[attr-defined]
     ticker.on_ticks = reader.on_ticks
     ticker.on_connect = reader.on_connect
     ticker.on_reconnect = reader.on_reconnect
+
+    logger.info("live_reader_start", focus=len(focus))
+    ticker.connect(threaded=True)
+    try:
+        while not stop.wait(timeout=30):
+            reader.persist_buffered()   # flush 1-min bars every 30s
+            if _ist_today() != today:   # midnight rollover → re-evaluate the day
+                logger.info("live_reader_day_rollover", was=str(today))
+                break
+    finally:
+        ticker.close()
+        reader.persist_buffered()
+        logger.info("live_reader_session_ended", date=str(today))
+
+
+def _daemon_loop(s: object, stop: threading.Event) -> None:
+    """Resilient daemon: NEVER exit on a transient "can't run yet" condition — under
+    compose's `restart: unless-stopped`, exiting (0 on a weekend, 1 on a missing
+    morning token) becomes a tight restart loop (seen: 150+ restarts over a weekend).
+    Instead sleep and re-check so the same process spans non-trading days and the
+    daily `trading auth` gap, and streams once each session opens."""
+    logger.info("live_reader_daemon_start")
+    while not stop.is_set():
+        today = _ist_today()
+        if not is_trading_day(today):
+            logger.info("live_reader_non_trading_day", date=str(today))
+            stop.wait(timeout=_IDLE_RECHECK_SECONDS)
+            continue
+        try:
+            kite = get_authenticated_kite()
+        except AuthError as exc:
+            RedisBarBus().publish_alert("token_expired", str(exc))
+            logger.warning("live_reader_awaiting_token", detail=str(exc))
+            stop.wait(timeout=s.reader_token_poll_seconds)  # type: ignore[attr-defined]
+            continue
+        try:
+            _run_session(s, kite, today, stop)
+        except AuthError as exc:
+            RedisBarBus().publish_alert("token_expired", str(exc))
+            logger.warning("live_reader_token_lost_mid_session", detail=str(exc))
+            stop.wait(timeout=s.reader_token_poll_seconds)  # type: ignore[attr-defined]
+        except Exception as exc:
+            # A single bad session (network, Kite blip) must not kill the daemon.
+            logger.error("live_reader_session_failed", error=str(exc), exc_info=True)
+            stop.wait(timeout=60)
+    logger.info("live_reader_stopped")
+
+
+def main() -> int:
+    s = get_settings()
+    setup_logging(s.log_level)
 
     stop = threading.Event()
 
@@ -203,15 +253,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
-    logger.info("live_reader_start", focus=len(focus))
-    ticker.connect(threaded=True)
-    try:
-        while not stop.wait(timeout=30):
-            reader.persist_buffered()   # flush 1-min bars every 30s
-    finally:
-        ticker.close()
-        reader.persist_buffered()
-        logger.info("live_reader_stopped")
+    _daemon_loop(s, stop)
     return 0
 
 
