@@ -10,6 +10,7 @@ rebuild would produce. Prior-session bars matter twice:
     live features would silently diverge from the validated ones.
 """
 import math
+from datetime import UTC
 
 import pandas as pd
 
@@ -21,8 +22,21 @@ _FEATURE_NAMES = FEATURE_SETS["intraday_v2"].feature_names
 
 
 def bars_to_frame(bars: list[BarEvent]) -> pd.DataFrame:
+    """Build the OHLCV frame, normalizing every ts to UTC.
+
+    DB-seeded history bars carry UTC tzinfo (psycopg's TIMESTAMPTZ read); live
+    ticker-aggregated bars carry IST tzinfo (live_app._tick_timestamp attaches it
+    deliberately, to preserve wall-clock hour/minute for the aggregator's session
+    buckets). Mixing tz-aware datetimes with different UTC offsets in one pandas
+    column makes `pd.to_datetime` raise ("Tz-aware datetime.datetime cannot be
+    converted to datetime64 unless utc=True") — caught live: this crashed on_ticks
+    on nearly every published bar and forced a WebSocket reconnect each time.
+    Converting to one common offset here preserves the absolute instant (and the
+    session-grouping calendar date, since NSE's 09:15-15:30 IST session never
+    crosses a UTC midnight — see data/storage.py:_ist_day_bounds) while avoiding it.
+    """
     return pd.DataFrame({
-        "ts": [b.ts for b in bars],
+        "ts": [b.ts.astimezone(UTC) if b.ts.tzinfo else b.ts for b in bars],
         "open": [b.open for b in bars],
         "high": [b.high for b in bars],
         "low": [b.low for b in bars],

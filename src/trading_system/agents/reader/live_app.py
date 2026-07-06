@@ -103,6 +103,12 @@ def build_focus_universe(today: date) -> list[str]:
     held: list[str] = []
     try:
         with get_connection() as conn:
+            # Autocommit BEFORE any query: PostgresLedger's constructor flips
+            # autocommit=True, which psycopg refuses once a plain SELECT has already
+            # opened a transaction on this connection (ProgrammingError: connection
+            # in transaction status INTRANS) — caught live: this silently dropped
+            # held-position resolution every cycle (masked by the outer except).
+            conn.autocommit = True
             focus = read_focus_list(conn, today)
             if focus:
                 logger.info("focus_from_analyst", n=len(focus))

@@ -53,11 +53,14 @@ class _Ledger:
 def _patches(*, focus_list, screen, held=(), screen_raises=False, conn_raises=False):
     import contextlib
 
+    class _Conn:
+        autocommit = False   # build_focus_universe sets this before any query
+
     @contextlib.contextmanager
     def fake_conn():
         if conn_raises:
             raise RuntimeError("db down")
-        yield object()
+        yield _Conn()
 
     def fake_screen(conn, pool, today, **kw):
         if screen_raises:

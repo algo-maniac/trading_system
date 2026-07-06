@@ -28,6 +28,12 @@ def _day_universe() -> list[str]:
 
     s = get_settings()
     with get_connection() as conn:
+        # Autocommit BEFORE any query — see live_app.py's build_focus_universe for
+        # the INTRANS bug this avoids (PostgresLedger can't flip autocommit once a
+        # plain SELECT has opened a transaction on the same connection). This path
+        # is wrapped by the scheduler's symbols_fn try/except, so the bug was
+        # silently falling back to the last-known universe every cycle.
+        conn.autocommit = True
         admitted = active_universe_members(conn)
         held = sorted({p.symbol for p in PostgresLedger(conn).open_positions()})
     return list(dict.fromkeys(list(s.nifty_200_symbols) + admitted + held))
