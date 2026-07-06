@@ -34,6 +34,22 @@ LIQUID_SYMBOLS: list[str] = [
     "BHARTIARTL", "HINDUNILVR", "BAJFINANCE",
 ]
 
+# Static safety-net universe for the intraday reader-live focus. Used only when the
+# Analyst's focus_list is missing AND the live volatile screen comes back empty or
+# errors (e.g. a lapsed Kite token left recent OHLCV stale, or a DB hiccup) — it is
+# valid with ZERO DB dependency, so reader-live always has a sane universe to stream.
+# = a frozen volatile-screen snapshot (mid-cap movers where the gap-ORB edge lives)
+# ∪ the liquid large-cap anchors. Refresh monthly alongside the volatile screen:
+#   trading screen-volatile --top-n 20 --lookback-days 90
+# Snapshot taken 2026-07-06.
+INTRADAY_FALLBACK_SYMBOLS: list[str] = list(dict.fromkeys([
+    "ATGL", "GVT&D", "ADANIENSOL", "GROWW", "ENRIN",
+    "TATACOMM", "ADANIGREEN", "ADANIPOWER", "POWERINDIA", "BHEL",
+    "IDEA", "VEDL", "TIINDIA", "COFORGE", "TMCV",
+    "SWIGGY", "LODHA", "COCHINSHIP", "KPITTECH", "KALYANKJIL",
+    *LIQUID_SYMBOLS,
+]))
+
 # NIFTY 200 constituents (official NSE list, fetched 2026-07). The deployed swing/momentum
 # book universe: broad enough to diversify cross-sectional momentum's single-name
 # concentration risk (Phase 5R finding) without going so wide that liquidity/slippage
@@ -112,6 +128,10 @@ class Settings(BaseSettings):
     liquid_symbols: list[str] = Field(default_factory=lambda: LIQUID_SYMBOLS)
     # Deployed swing/momentum book universe (Phase 5R) — see NIFTY_200_SYMBOLS for rationale.
     nifty_200_symbols: list[str] = Field(default_factory=lambda: NIFTY_200_SYMBOLS)
+    # Static last-resort intraday universe when the focus_list + live screen both fail.
+    intraday_fallback_symbols: list[str] = Field(
+        default_factory=lambda: INTRADAY_FALLBACK_SYMBOLS
+    )
 
     # Reader agent (scheduled incremental ingestion)
     # Default = the swing sleeves' EOD day-bar path (Nifty 200 + v3 features, publishes

@@ -55,31 +55,77 @@ def _tick_timestamp(tick: dict) -> datetime:  # type: ignore[type-arg]
     return raw.replace(tzinfo=_IST) if raw.tzinfo is None else raw
 
 
-def build_focus_universe(today: date) -> list[str]:
-    """Intraday focus list for today.
+def _assemble_focus(focus: list[str], held: list[str], fallback: list[str],
+                    cap: int = _MAX_FOCUS) -> tuple[list[str], bool]:
+    """Held-first union, capped; drop to the static `fallback` when `focus` is empty.
 
-    Primary source: the Analyst's persisted `focus_list` (news ∪ gap-watch ∪ screen ∪
-    liquid ∪ held, already prioritized and capped). Fallback when the Analyst hasn't
-    run (or is down): the pre-5c inline computation — an unavailable news layer must
-    degrade coverage quality, never blind the system. Either way, open positions from
-    the ledger are unioned in defensively: an exit must never lose its data feed.
+    Held positions go first so an open name always survives the cap (its exit must
+    keep a data feed). Returns (ordered_symbols, used_fallback)."""
+    used_fallback = not focus
+    src = list(focus) if focus else list(fallback)
+    ordered = list(dict.fromkeys(list(held) + src))
+    return ordered[:cap], used_fallback
+
+
+def _screen_fallback(conn: object, s: object, today: date) -> list[str]:
+    """The computed middle-tier fallback (live volatile screen ∪ liquid anchors),
+    guarded so a screen/DB error degrades to [] (→ static fallback) instead of raising."""
+    try:
+        screen = volatile_universe(conn, s.nifty_200_symbols, today)  # type: ignore[attr-defined]
+        if not screen:
+            # An empty screen must fall through to the richer STATIC fallback (frozen
+            # movers ∪ liquid), not collapse to bare liquid anchors (13 large-caps,
+            # a weak intraday universe) — that thin case is what we're guarding against.
+            return []
+        return list(dict.fromkeys(screen + list(s.liquid_symbols)))   # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.error("focus_screen_failed", error=str(exc))
+        return []
+
+
+def build_focus_universe(today: date) -> list[str]:
+    """Intraday focus list for today — NEVER empty, NEVER raises.
+
+    Degrades through three tiers so the intraday sleeve always has a sane universe:
+      1. Analyst's persisted `focus_list` (news ∪ gap-watch ∪ screen ∪ liquid ∪ held);
+      2. else the live volatile screen ∪ liquid anchors (computed, DB-dependent);
+      3. else the STATIC `intraday_fallback_symbols` constant — valid with zero DB
+         dependency, so a lapsed token / empty screen / DB outage can't blind the
+         reader (this was the gap the un-renewed-token morning exposed).
+    Open positions from the ledger are unioned in first (an exit must keep its feed).
+    Any DB failure is swallowed and we still return the static fallback + alert.
     """
     from trading_system.data.news_store import read_focus_list
     from trading_system.execution.ledger import PostgresLedger
 
     s = get_settings()
-    with get_connection() as conn:
-        focus = read_focus_list(conn, today)
-        if focus:
-            logger.info("focus_from_analyst", n=len(focus))
-        else:
-            logger.warning("focus_fallback_inline", reason="no focus_list row for today")
-            focus = list(dict.fromkeys(
-                volatile_universe(conn, s.nifty_200_symbols, today) + s.liquid_symbols
-            ))
-        held = sorted({p.symbol for p in PostgresLedger(conn).open_positions()})
-    ordered = list(dict.fromkeys(held + focus))   # held first → survives the cap
-    return ordered[:_MAX_FOCUS]
+    focus: list[str] = []
+    held: list[str] = []
+    try:
+        with get_connection() as conn:
+            focus = read_focus_list(conn, today)
+            if focus:
+                logger.info("focus_from_analyst", n=len(focus))
+            else:
+                logger.warning("focus_fallback_inline", reason="no focus_list row for today")
+                focus = _screen_fallback(conn, s, today)
+            held = sorted({p.symbol for p in PostgresLedger(conn).open_positions()})
+    except Exception as exc:
+        # Total DB failure — keep going; the static fallback needs no DB.
+        logger.error("focus_build_db_failed", error=str(exc))
+
+    ordered, used_fallback = _assemble_focus(focus, held, s.intraday_fallback_symbols)
+    if used_fallback:
+        logger.warning("focus_static_fallback", n=len(ordered))
+        try:
+            RedisBarBus().publish_alert(
+                "focus_static_fallback",
+                f"focus_list + live screen unavailable; streaming {len(ordered)} "
+                "static fallback symbols",
+            )
+        except Exception as exc:
+            logger.error("focus_fallback_alert_failed", error=str(exc))
+    return ordered
 
 
 class LiveReader:
