@@ -13,6 +13,8 @@ import threading
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import redis
+
 from trading_system.agents.analyst.core import AnalystCore, AnalystDeps
 from trading_system.bus.redis_streams import RedisBarBus
 from trading_system.config import get_settings
@@ -29,6 +31,26 @@ logger = get_logger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 _FOCUS_BUILD_BEFORE = time(12, 0)  # a sweep before noon also (re)builds today's focus
+
+_REJECTED_KEY = "analyst:rejected:{date}"
+_REJECTED_TTL = 3 * 86_400  # self-expiring, matches net.limits' daily-key convention
+
+
+def _redis() -> redis.Redis:  # type: ignore[type-arg]
+    return redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+
+
+def rejected_today(today: date) -> set:
+    """Symbols already rejected by an earlier sweep today — Redis, not in-process
+    state, so it survives an analyst restart same as the admissions themselves do."""
+    return set(_redis().smembers(_REJECTED_KEY.format(date=today.isoformat())))
+
+
+def mark_rejected(symbol: str, today: date) -> None:
+    key = _REJECTED_KEY.format(date=today.isoformat())
+    r = _redis()
+    r.sadd(key, symbol)
+    r.expire(key, _REJECTED_TTL)
 
 
 def build_core(conn) -> AnalystCore:
@@ -83,6 +105,9 @@ def build_core(conn) -> AnalystCore:
         write_focus=lambda d, entries: news_store.write_focus_list(conn, d, entries),
         alert=bus.publish_alert,
         admission_cap_per_day=s.admission_max_new_per_day,
+        admissions_today_count=lambda d: news_store.count_admissions_on(conn, d),
+        rejected_today=rejected_today,
+        mark_rejected=mark_rejected,
     )
     return AnalystCore(deps)
 
@@ -104,6 +129,26 @@ def run_cycle(core: AnalystCore, now: datetime | None = None) -> dict:  # type: 
     return {**result, "admitted": admitted, "focus": focus_n}
 
 
+def run_cycle_fresh() -> dict:  # type: ignore[type-arg]
+    """One full cycle on a FRESH DB connection, built and torn down per invocation.
+
+    The analyst used to bind ONE long-lived connection at startup; when that connection
+    dropped (DB restart / idle timeout) every scheduled cycle failed on the dead handle
+    while the process stayed alive — so compose's `restart: unless-stopped` never fired
+    and the agent silently wedged (seen live 2026-07-05). A per-cycle connection makes a
+    bad connection cost exactly one cycle: the next tick reconnects and self-heals.
+    Rebuilding the core each time is safe because the admissions cap is DB-derived, not
+    in-process state. Errors are caught + logged loudly (never silent) and the cycle is
+    skipped, so one failure can neither crash the agent nor vanish unnoticed."""
+    try:
+        with get_connection() as conn:
+            core = build_core(conn)
+            return run_cycle(core)
+    except Exception as exc:
+        logger.error("analyst_cycle_failed", error=str(exc), exc_info=True)
+        return {"status": "error", "error": str(exc)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Analyst agent (news → universe → focus).")
     parser.add_argument("--once", action="store_true", help="run one cycle now and exit")
@@ -111,34 +156,43 @@ def main(argv: list[str] | None = None) -> int:
 
     s = get_settings()
     setup_logging(s.log_level)
-    with get_connection() as conn:
-        core = build_core(conn)
-        if args.once:
-            run_cycle(core)
-            return 0
+    if args.once:
+        run_cycle_fresh()
+        return 0
 
-        from apscheduler.schedulers.background import BackgroundScheduler
-        from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
 
-        sched = BackgroundScheduler(timezone=IST)
-        sched.add_job(lambda: run_cycle(core),
-                      CronTrigger.from_crontab(s.analyst_sweep_cron, timezone=IST),
-                      id="analyst_cycle", max_instances=1, coalesce=True,
-                      misfire_grace_time=None)
-        sched.start()
-        logger.info("analyst_started", cron=s.analyst_sweep_cron, llm=core.d.llm.name)
+    def _on_scheduler_event(event: object) -> None:
+        # Surface job errors/misses through our logger — a silently missed sweep is
+        # exactly what hid the original wedge.
+        if getattr(event, "exception", None) is not None:
+            logger.error("analyst_scheduler_job_error", exception=str(event.exception))
+        else:
+            logger.warning("analyst_scheduler_job_missed", scheduled_run_time=str(
+                getattr(event, "scheduled_run_time", None)))
 
-        stop = threading.Event()
+    sched = BackgroundScheduler(timezone=IST)
+    sched.add_job(run_cycle_fresh,
+                  CronTrigger.from_crontab(s.analyst_sweep_cron, timezone=IST),
+                  id="analyst_cycle", max_instances=1, coalesce=True,
+                  misfire_grace_time=None)
+    sched.add_listener(_on_scheduler_event, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
+    sched.start()
+    logger.info("analyst_started", cron=s.analyst_sweep_cron, llm=get_llm().name)
 
-        def _handle(signum: int, _frame: object) -> None:
-            logger.info("analyst_shutdown_signal", signum=signum)
-            stop.set()
+    stop = threading.Event()
 
-        signal.signal(signal.SIGINT, _handle)
-        signal.signal(signal.SIGTERM, _handle)
-        run_cycle(core)   # startup catch-up, same idiom as the reader
-        stop.wait()
-        sched.shutdown(wait=False)
+    def _handle(signum: int, _frame: object) -> None:
+        logger.info("analyst_shutdown_signal", signum=signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+    run_cycle_fresh()   # startup catch-up, same idiom as the reader
+    stop.wait()
+    sched.shutdown(wait=False)
     return 0
 
 

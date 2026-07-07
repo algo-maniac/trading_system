@@ -214,6 +214,23 @@ class Settings(BaseSettings):
     reporter_poll_seconds: float = 60.0
     reports_dir: Path = Path("./reports")
 
+    # --- Token-expiry email reminders (SMTP) ---
+    # Kite access tokens die at midnight IST and must be re-minted each morning via
+    # `trading auth`. This notifier emails every `token_alert_cron` tick within the
+    # [start, end] IST window on trading days, ONLY while today's token is still missing
+    # — and stops (with one confirmation) the moment it's renewed.
+    # Gmail: smtp_password must be an App Password (needs 2-Step Verification), not the
+    # account password. If user/password/recipient are unset the notifier no-ops.
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""                # sending account (e.g. your Gmail address)
+    smtp_password: str = ""            # Gmail App Password
+    alert_email_from: str = ""         # defaults to smtp_user when blank
+    alert_email_to: str = ""           # recipient — set ALERT_EMAIL_TO in .env (gitignored)
+    token_alert_cron: str = "*/20 * * * *"   # every 20 min; window-gated below
+    token_alert_start_ist: str = "07:00"     # first nag ~2h before the 09:15 open
+    token_alert_end_ist: str = "15:30"       # stop nagging after the session closes
+
 
 _settings: Settings | None = None
 

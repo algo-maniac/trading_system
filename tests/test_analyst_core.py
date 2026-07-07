@@ -22,12 +22,14 @@ def _item(sym, sentiment="positive", ann_type="Order Win", link=None, significan
 
 
 class Recorder:
-    def __init__(self, *, sessions=300, turnover_cr=80.0, known=True):
+    def __init__(self, *, sessions=300, turnover_cr=80.0, known=True, admissions_today=0):
         self.stored, self.gap, self.backfilled, self.admitted, self.alerts = [], [], [], [], []
         self.focus_written = {}
+        self.rejected: set = set()
         self._sessions = sessions
         self._turnover = turnover_cr
         self._known = known
+        self._admissions_today = admissions_today
 
     def deps(self, **over):
         d = AnalystDeps(
@@ -48,10 +50,27 @@ class Recorder:
             held_symbols=lambda: [],
             write_focus=lambda d_, entries: self.focus_written.update(entries) or len(entries),
             alert=lambda kind, detail: self.alerts.append(kind),
+            admissions_today_count=lambda d: self._admissions_today,
+            rejected_today=lambda d: set(self.rejected),
+            mark_rejected=lambda s, d: self.rejected.add(s),
         )
         for k, v in over.items():
             setattr(d, k, v)
         return d
+
+
+class CountingLLM:
+    """Wraps MockLLM's verdicts while counting how many review calls actually happened —
+    used to prove the quant-gate short-circuit skips the round-trip entirely."""
+    name = "counting-mock"
+
+    def __init__(self):
+        self.calls = 0
+        self._inner = MockLLM()
+
+    def review_admission(self, context):
+        self.calls += 1
+        return self._inner.review_admission(context)
 
 
 def test_sweep_stores_and_builds_gap_watch():
@@ -157,6 +176,47 @@ def test_admission_skips_names_already_in_base_universe():
     core = AnalystCore(rec.deps(base_universe=lambda: ["NESTLEIND"]))
     assert core.consider_admissions([_item("NESTLEIND")], TODAY) == []
     assert rec.admitted == []
+
+
+def test_admission_cap_is_derived_not_in_process_state():
+    """The cap must come from admissions_today_count (DB-backed), not an instance
+    attribute — so a restarted/rebuilt AnalystCore can't silently reset it to zero."""
+    rec = Recorder(admissions_today=8)
+    deps = rec.deps()
+    deps.admission_cap_per_day = 10
+    core = AnalystCore(deps)
+    items = [_item(f"CO{i}", link=f"https://x/{i}") for i in range(5)]
+    admitted = core.consider_admissions(items, TODAY)
+    assert len(admitted) == 2   # only 2 of the day's 10-cap remain
+
+
+def test_admission_skips_symbols_already_rejected_today():
+    """A symbol rejected on an earlier sweep today must not be re-reviewed (or
+    re-backfilled) when it reappears in a later sweep's news window."""
+    rec = Recorder()
+    rec.rejected.add("REJCO")
+    core = AnalystCore(rec.deps())
+    assert core.consider_admissions([_item("REJCO")], TODAY) == []
+    assert rec.admitted == []
+    assert rec.backfilled == []   # never even entered the review pipeline
+
+
+def test_admission_skips_llm_call_when_quant_gates_fail():
+    """Every LLM (mock and real) rejects unconditionally on passed_gates=False —
+    the round-trip must be skipped, not just its result discarded."""
+    rec = Recorder(turnover_cr=5.0)   # below the ₹50cr gate
+    llm = CountingLLM()
+    core = AnalystCore(rec.deps(llm=llm))
+    assert core.consider_admissions([_item("THINCO")], TODAY) == []
+    assert llm.calls == 0
+    assert "THINCO" in rec.rejected   # cached so tomorrow's sweep skips it too
+
+
+def test_admission_llm_rejection_is_cached_for_next_sweep():
+    rec = Recorder()
+    core = AnalystCore(rec.deps())
+    assert core.consider_admissions([_item("BADCO", sentiment="negative")], TODAY) == []
+    assert "BADCO" in rec.rejected
 
 
 def test_admission_backfill_failure_skips_candidates_not_cycle():

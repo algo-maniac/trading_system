@@ -89,3 +89,44 @@ def test_fees_reduce_cash_when_enabled():
     broker.place(_buy())
     broker.on_bar(_bar(3, open_=2000.0))
     assert ledger.sleeve_cash("momentum") < 1_000_000 - 200_000  # fees on top of notional
+
+
+def test_crash_mid_fill_rolls_back_then_redelivery_reapplies_cleanly():
+    """A crash AFTER the cash debit but BEFORE the position write must leave the ledger
+    untouched (fill + cash + position roll back together), so the redelivered bar can
+    re-apply the whole fill exactly once. Without the transaction the fill-insert gate
+    would skip re-application, stranding debited cash with no position."""
+    broker, ledger = _broker()
+    broker.place(_buy())
+
+    # Arm a crash inside the fill transaction, right after adjust_sleeve_cash, before
+    # the position row is written.
+    armed = {"on": True}
+    real_upsert = ledger.upsert_open_position
+
+    def crashing_upsert(*a, **k):
+        if armed["on"]:
+            raise RuntimeError("process killed mid-fill")
+        return real_upsert(*a, **k)
+
+    ledger.upsert_open_position = crashing_upsert
+
+    with pytest.raises(RuntimeError):
+        broker.on_bar(_bar(3, open_=2000.0))
+
+    # Everything rolled back: no fill, no position, cash intact, order still PENDING.
+    assert ledger.fills == []
+    assert ledger.open_position("momentum", "RELIANCE") is None
+    assert ledger.sleeve_cash("momentum") == pytest.approx(1_000_000)
+    assert [o.status for o in ledger.pending_orders(symbol="RELIANCE")] == ["PENDING"]
+
+    # Recovery: the process restarts, the bus redelivers the bar, the fill now sticks —
+    # exactly once (cash debited once, one position, order FILLED).
+    armed["on"] = False
+    fills = broker.on_bar(_bar(3, open_=2000.0))
+    assert len(fills) == 1
+    assert len(ledger.fills) == 1
+    pos = ledger.open_position("momentum", "RELIANCE")
+    assert pos is not None and pos.qty == 100
+    assert ledger.sleeve_cash("momentum") == pytest.approx(800_000)
+    assert ledger.orders[0]["status"] == "FILLED"

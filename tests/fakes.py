@@ -1,4 +1,6 @@
 """In-memory LedgerRepo fake for DB-free unit tests (mirrors PostgresLedger semantics)."""
+import copy
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -13,6 +15,18 @@ class FakeLedger:
         self.positions: list[dict] = []
         self.sleeves: dict[str, dict] = {}
         self.equity_snapshots: list[dict] = []
+
+    @contextmanager
+    def atomic(self):
+        """Model a DB transaction: snapshot the mutable ledger state on entry and, on
+        any exception inside the block, restore it — so tests see the same all-or-nothing
+        rollback PostgresLedger.atomic() gives via psycopg's transaction()."""
+        snap = copy.deepcopy((self.orders, self.fills, self.positions, self.sleeves))
+        try:
+            yield
+        except Exception:
+            self.orders, self.fills, self.positions, self.sleeves = copy.deepcopy(snap)
+            raise
 
     # --- signals ---
     def insert_signal(self, sig: dict) -> bool:

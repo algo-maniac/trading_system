@@ -77,13 +77,23 @@ class PaperBroker:
                 clean_price=bar.open, slippage_bps=self._slippage_bps,
                 product=Product(order.product), fees_enabled=self._fees_enabled,
             )
-            # insert_fill is the idempotency gate: False = already filled (redelivered bar)
-            if not self._ledger.insert_fill(
-                order.id, fill.ts, fill.qty, fill.price, fill.fees, fill.slippage
-            ):
+            # Fill insert + cash/position mutation + order status are ONE transaction: a
+            # crash (or DB drop) partway through rolls the whole thing back rather than
+            # leaving a fill recorded with cash/position half-applied. Without this the
+            # fill-insert gate would then skip re-application on the redelivered bar,
+            # stranding the ledger inconsistent (debited cash but no position, or a
+            # "sold" position still marked open). insert_fill returns False only for a
+            # COMMITTED prior fill (genuine redelivery) → nothing to do.
+            filled = False
+            with self._ledger.atomic():
+                if self._ledger.insert_fill(
+                    order.id, fill.ts, fill.qty, fill.price, fill.fees, fill.slippage
+                ):
+                    self._apply_to_ledger(order, fill)
+                    self._ledger.set_order_status(order.id, "FILLED")
+                    filled = True
+            if not filled:
                 continue
-            self._apply_to_ledger(order, fill)
-            self._ledger.set_order_status(order.id, "FILLED")
             fills.append((order.id, fill))
             logger.info(
                 "paper_fill", order_id=order.id, sleeve=order.sleeve, symbol=order.symbol,

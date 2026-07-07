@@ -79,6 +79,36 @@ def test_session_exception_does_not_kill_daemon():
     assert stop.waits == [60, 60]         # backed off after each failed session
 
 
+class _FakeBus:
+    def __init__(self) -> None:
+        self.alerts: list[str] = []
+
+    def publish_alert(self, kind, detail):  # noqa: ANN001
+        self.alerts.append(kind)
+
+
+def _reader(focus=("RELIANCE",)):
+    with patch.object(live_app, "RedisBarBus", return_value=_FakeBus()):
+        return live_app.LiveReader(list(focus), {s: i for i, s in enumerate(focus)})
+
+
+def test_on_reconnect_below_threshold_does_not_request_rebuild():
+    reader = _reader()
+    # Transient drops that would succeed reset the count in KiteTicker; even a handful
+    # of attempts short of the threshold must not tear the ticker down.
+    reader.on_reconnect(None, 1)
+    reader.on_reconnect(None, live_app._REBUILD_AFTER_RECONNECTS - 1)
+    assert not reader.needs_rebuild()
+
+
+def test_on_reconnect_at_threshold_requests_rebuild():
+    reader = _reader()
+    reader.on_reconnect(None, live_app._REBUILD_AFTER_RECONNECTS)
+    # This is what breaks the 403-forever loop: the supervisor sees it and rebuilds
+    # the ticker with a freshly-read token (the daily-rotation recovery).
+    assert reader.needs_rebuild()
+
+
 def test_ist_today_uses_ist_not_utc():
     # 18:56 UTC on a Sunday is already past midnight IST → Monday. date.today() (UTC)
     # would say Sunday; _ist_today must say Monday.

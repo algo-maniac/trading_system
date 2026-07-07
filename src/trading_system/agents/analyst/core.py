@@ -53,12 +53,20 @@ class AnalystDeps:
     write_focus: Callable[[date, dict], int] = None      # type: ignore[assignment]
     alert: Callable[[str, str], None] = None             # type: ignore[assignment]
     admission_cap_per_day: int = 10
+    # Cap + rejection-cache state live outside this process (DB / Redis) rather than
+    # in an instance attribute, so a restart or a rebuilt AnalystCore (e.g. after a
+    # dropped DB connection) can't silently reset either one.
+    admissions_today_count: Callable[[date], int] = field(
+        default_factory=lambda: (lambda _d: 0))
+    rejected_today: Callable[[date], set] = field(
+        default_factory=lambda: (lambda _d: set()))
+    mark_rejected: Callable[[str, date], None] = field(
+        default_factory=lambda: (lambda _s, _d: None))
 
 
 class AnalystCore:
     def __init__(self, deps: AnalystDeps) -> None:
         self.d = deps
-        self._admissions_today: tuple[date, int] | None = None
 
     # --- sweep --------------------------------------------------------------------
 
@@ -100,11 +108,16 @@ class AnalystCore:
         """News-discovered symbols not yet tradable → the admission pipeline."""
         current = set(self.d.base_universe()) | set(self.d.liquid_symbols()) \
             | set(self.d.active_members()) | set(self.d.volatile_screen())
+        # Symbols already rejected earlier today (previous sweep) — same news window
+        # would otherwise re-run the same quant/LLM review for a verdict that hasn't
+        # changed, burning a real LLM call each time.
+        rejected = self.d.rejected_today(today)
         candidates: list[NewsItem] = []
         seen: set = set()
         for item in items:
             sym = item.nse_symbol
-            if not sym or sym in current or sym in seen or not self._is_material(item):
+            if (not sym or sym in current or sym in rejected or sym in seen
+                    or not self._is_material(item)):
                 continue
             seen.add(sym)
             candidates.append(item)
@@ -142,6 +155,14 @@ class AnalystCore:
                 "avg_range_pct": stats["avg_range_pct"] if stats else 0.0,
                 "passed_gates": passed,
             }
+            if not passed:
+                # Every LLM (mock and real) fails this closed unconditionally on
+                # passed_gates=False — the round-trip never changes the outcome, so
+                # skip it and reject directly.
+                logger.info("admission_review", symbol=sym, admit=False, confidence=1.0,
+                            reasoning="quant_gates_failed")
+                self.d.mark_rejected(sym, today)  # type: ignore[misc]
+                continue
             verdict: Verdict = self.d.llm.review_admission(AdmissionContext(
                 symbol=sym, company_name=item.company_name,  # type: ignore[arg-type]
                 announcement_type=item.announcement_type, sentiment=item.sentiment,
@@ -156,20 +177,15 @@ class AnalystCore:
                             "reasoning": verdict.reasoning, "reviewer": self.d.llm.name},
             }):
                 admitted.append(sym)  # type: ignore[arg-type]
-                self._count_admission(today)
+            elif not verdict.admit:
+                self.d.mark_rejected(sym, today)  # type: ignore[misc]
         if admitted:
             self.d.alert("universe_admissions", ",".join(admitted))
         return admitted
 
     def _remaining_cap(self, today: date) -> int:
-        day, used = self._admissions_today or (today, 0)
-        if day != today:
-            used = 0
+        used = self.d.admissions_today_count(today)
         return max(0, self.d.admission_cap_per_day - used)
-
-    def _count_admission(self, today: date) -> None:
-        day, used = self._admissions_today or (today, 0)
-        self._admissions_today = (today, used + 1 if day == today else 1)
 
     # --- focus list -------------------------------------------------------------------
 

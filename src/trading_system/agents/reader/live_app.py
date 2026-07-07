@@ -39,6 +39,13 @@ _MAX_FOCUS = 50
 _HISTORY_SESSIONS = 2   # prior sessions kept in the feature frame (warmup + gap_pct)
 _HISTORY_MAX_BARS = 75 * (_HISTORY_SESSIONS + 1)
 _IST = ZoneInfo("Asia/Kolkata")
+# KiteTicker bakes the access token in at construction and reuses it for every internal
+# auto-reconnect. When the token rotates (daily expiry at midnight IST) the WS upgrade
+# 403s forever and on_connect never fires to reset the attempt count. After this many
+# consecutive failed reconnects we tear the ticker down so the daemon re-authenticates
+# with a freshly-read token. High enough that ordinary transient drops (which succeed and
+# reset the count) never reach it; low enough to recover a rotation within ~1-2 min.
+_REBUILD_AFTER_RECONNECTS = 8
 
 
 def _tick_timestamp(tick: dict) -> datetime:  # type: ignore[type-arg]
@@ -144,6 +151,12 @@ class LiveReader:
         self._history: dict[str, list] = {sym: [] for sym in focus}
         self._minute_buffer: list = []
         self._lock = threading.Lock()
+        # Set by on_reconnect (ticker thread) when reconnects are exhausted; the session
+        # supervisor (main thread) polls it and tears the ticker down for a rebuild.
+        self._rebuild_needed = threading.Event()
+
+    def needs_rebuild(self) -> bool:
+        return self._rebuild_needed.is_set()
 
     def seed_history(self, today: date) -> None:
         """Load the prior sessions' 5-min bars so live features match historical ones."""
@@ -212,6 +225,12 @@ class LiveReader:
     def on_reconnect(self, _ws, attempts: int) -> None:
         logger.warning("live_ws_reconnected", attempts=attempts)
         self._bus.publish_alert("ws_reconnected", f"after {attempts} attempts; gap-repair advised")
+        # A successful reconnect fires on_connect (not this); a run of THESE with no
+        # on_connect means the connection can't be re-established with the current token
+        # — signal the supervisor to rebuild with a fresh one rather than 403 forever.
+        if attempts >= _REBUILD_AFTER_RECONNECTS:
+            logger.error("live_ws_reconnect_exhausted", attempts=attempts)
+            self._rebuild_needed.set()
 
     def on_connect(self, ws, _response) -> None:
         ws.subscribe(self._tokens)
@@ -250,6 +269,12 @@ def _run_session(s: object, kite: object, today: date, stop: threading.Event) ->
     try:
         while not stop.wait(timeout=30):
             reader.persist_buffered()   # flush 1-min bars every 30s
+            if reader.needs_rebuild():
+                # Ticker can't reconnect with the current token (rotation). Return to
+                # the daemon loop, which re-reads today's token from Redis and rebuilds.
+                logger.warning("live_reader_ticker_rebuild",
+                               reason="reconnect attempts exhausted; re-authenticating")
+                break
             if _ist_today() != today:   # midnight rollover → re-evaluate the day
                 logger.info("live_reader_day_rollover", was=str(today))
                 break

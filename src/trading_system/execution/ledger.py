@@ -8,6 +8,8 @@ the at-least-once bus can redeliver any event and the ledger stays correct:
   - position opens are unique per (sleeve, symbol, opened_ts)
 """
 import json
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -45,6 +47,7 @@ class PositionRow:
 
 
 class LedgerRepo(Protocol):
+    def atomic(self) -> AbstractContextManager[None]: ...     # all-or-nothing mutation group
     def insert_signal(self, sig: dict) -> bool: ...           # type: ignore[type-arg]
     def get_signal(self, signal_id: str) -> dict | None: ...  # type: ignore[type-arg]
     def insert_order(self, order: dict) -> OrderRow: ...      # type: ignore[type-arg]
@@ -72,6 +75,18 @@ class PostgresLedger:
     def __init__(self, conn: psycopg.Connection) -> None:  # type: ignore[type-arg]
         self._conn = conn
         self._conn.autocommit = True
+
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        """Run several mutations as ONE all-or-nothing transaction despite autocommit.
+
+        psycopg issues an explicit BEGIN/COMMIT for transaction() even in autocommit
+        mode (and ROLLBACK on any exception), so a crash partway through a fill
+        application leaves the ledger untouched instead of half-written — the
+        redelivered bar then re-applies the whole fill cleanly (the fill-insert
+        idempotency gate only protects a COMMITTED fill, never a partial one)."""
+        with self._conn.transaction():
+            yield
 
     def insert_signal(self, sig: dict) -> bool:  # type: ignore[type-arg]
         with self._conn.cursor() as cur:

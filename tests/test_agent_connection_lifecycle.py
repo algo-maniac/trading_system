@@ -15,6 +15,7 @@ _AGENT_APPS = [
     "src/trading_system/agents/reader/app.py",
     "src/trading_system/agents/reader/live_app.py",
     "src/trading_system/agents/backtester/app.py",
+    "src/trading_system/agents/analyst/app.py",
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]

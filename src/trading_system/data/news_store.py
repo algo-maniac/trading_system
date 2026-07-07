@@ -95,3 +95,15 @@ def active_universe_members(conn: psycopg.Connection) -> list[str]:  # type: ign
     with conn.cursor() as cur:
         cur.execute("SELECT symbol FROM universe_members WHERE active ORDER BY symbol")
         return [r[0] for r in cur.fetchall()]
+
+
+def count_admissions_on(conn: psycopg.Connection, day: date) -> int:  # type: ignore[type-arg]
+    """Admissions cap source of truth — derived from the table, not in-process state,
+    so it survives analyst restarts/reconnects without resetting to zero."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM universe_members "
+            "WHERE (admitted_ts AT TIME ZONE 'Asia/Kolkata')::date = %s",
+            (day,),
+        )
+        return cur.fetchone()[0]

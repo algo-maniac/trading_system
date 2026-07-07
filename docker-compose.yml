@@ -148,6 +148,20 @@ services:
         condition: service_healthy
     command: ["python", "-m", "trading_system.agents.reporter.app"]
 
+  # Ops: email (SMTP) reminders to re-mint the daily Kite token each morning.
+  # Only needs Redis (token lives there) — no DB dependency. No-ops quietly if the
+  # SMTP_USER/SMTP_PASSWORD/ALERT_EMAIL_TO vars are unset in .env.
+  token-notifier:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.token_notifier.app"]
+
 volumes:
   timescaledb_data:
   redis_data:
