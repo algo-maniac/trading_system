@@ -19,6 +19,8 @@ Run as a container:  python -m trading_system.agents.reader.live_app
 import signal
 import sys
 import threading
+import time
+from collections import deque
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -40,12 +42,16 @@ _HISTORY_SESSIONS = 2   # prior sessions kept in the feature frame (warmup + gap
 _HISTORY_MAX_BARS = 75 * (_HISTORY_SESSIONS + 1)
 _IST = ZoneInfo("Asia/Kolkata")
 # KiteTicker bakes the access token in at construction and reuses it for every internal
-# auto-reconnect. When the token rotates (daily expiry at midnight IST) the WS upgrade
-# 403s forever and on_connect never fires to reset the attempt count. After this many
-# consecutive failed reconnects we tear the ticker down so the daemon re-authenticates
-# with a freshly-read token. High enough that ordinary transient drops (which succeed and
-# reset the count) never reach it; low enough to recover a rotation within ~1-2 min.
-_REBUILD_AFTER_RECONNECTS = 8
+# auto-reconnect. Two failure shapes need a ticker rebuild (drop it, re-auth, reconnect):
+#   1. NEVER connects — token rotated at midnight IST → the WS 403s forever and on_connect
+#      never fires to reset KiteTicker's `attempts`, so `attempts` climbs unbounded.
+#   2. FLAPS — connects, streams a burst, drops (403), reconnects, repeat. Each on_connect
+#      resets `attempts`, so trigger (1) never fires; but a healthy link doesn't reconnect
+#      every minute, so a burst of reconnects in a short window is itself the signal.
+# (1) is caught by the consecutive-attempts threshold; (2) by a rolling-window count.
+_REBUILD_AFTER_RECONNECTS = 8          # (1) consecutive failed attempts, no on_connect
+_FLAP_WINDOW_SECONDS = 180.0           # (2) rolling window for reconnect-rate
+_FLAP_MAX_RECONNECTS = 5               # (2) this many reconnects within the window = flapping
 
 
 def _tick_timestamp(tick: dict) -> datetime:  # type: ignore[type-arg]
@@ -151,9 +157,11 @@ class LiveReader:
         self._history: dict[str, list] = {sym: [] for sym in focus}
         self._minute_buffer: list = []
         self._lock = threading.Lock()
-        # Set by on_reconnect (ticker thread) when reconnects are exhausted; the session
-        # supervisor (main thread) polls it and tears the ticker down for a rebuild.
+        # Set by on_reconnect (ticker thread) when reconnects are exhausted OR flapping;
+        # the session supervisor (main thread) polls it and tears the ticker down.
         self._rebuild_needed = threading.Event()
+        self._reconnect_times: deque[float] = deque()   # monotonic ts of recent reconnects
+        self._clock = time.monotonic                    # injectable for tests
 
     def needs_rebuild(self) -> bool:
         return self._rebuild_needed.is_set()
@@ -225,11 +233,19 @@ class LiveReader:
     def on_reconnect(self, _ws, attempts: int) -> None:
         logger.warning("live_ws_reconnected", attempts=attempts)
         self._bus.publish_alert("ws_reconnected", f"after {attempts} attempts; gap-repair advised")
-        # A successful reconnect fires on_connect (not this); a run of THESE with no
-        # on_connect means the connection can't be re-established with the current token
-        # — signal the supervisor to rebuild with a fresh one rather than 403 forever.
-        if attempts >= _REBUILD_AFTER_RECONNECTS:
-            logger.error("live_ws_reconnect_exhausted", attempts=attempts)
+        # Record this reconnect and prune anything older than the flap window.
+        now = self._clock()
+        self._reconnect_times.append(now)
+        cutoff = now - _FLAP_WINDOW_SECONDS
+        while self._reconnect_times and self._reconnect_times[0] < cutoff:
+            self._reconnect_times.popleft()
+        # Rebuild if it CAN'T connect (attempts climb, on_connect never resets them) OR if
+        # it keeps flapping (many reconnects in the window even though on_connect resets
+        # `attempts` each time — the case a plain consecutive-count check misses).
+        flapping = len(self._reconnect_times) >= _FLAP_MAX_RECONNECTS
+        if attempts >= _REBUILD_AFTER_RECONNECTS or flapping:
+            logger.error("live_ws_reconnect_exhausted", attempts=attempts,
+                         window_reconnects=len(self._reconnect_times), flapping=flapping)
             self._rebuild_needed.set()
 
     def on_connect(self, ws, _response) -> None:

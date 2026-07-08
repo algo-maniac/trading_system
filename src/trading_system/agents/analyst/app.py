@@ -164,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
+    from trading_system.agents.scheduler_watchdog import start_watchdog
+
     def _on_scheduler_event(event: object) -> None:
         # Surface job errors/misses through our logger — a silently missed sweep is
         # exactly what hid the original wedge.
@@ -190,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
+    # Restart the process if the scheduler thread dies (e.g. host suspend) so a missed
+    # sweep can't go unnoticed; startup catch-up below re-runs the missed cycle.
+    start_watchdog(sched, "analyst_cycle", stop, grace_seconds=600.0)
     run_cycle_fresh()   # startup catch-up, same idiom as the reader
     stop.wait()
     sched.shutdown(wait=False)

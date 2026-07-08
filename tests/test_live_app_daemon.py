@@ -109,6 +109,32 @@ def test_on_reconnect_at_threshold_requests_rebuild():
     assert reader.needs_rebuild()
 
 
+def test_flapping_triggers_rebuild_even_when_attempts_stay_low():
+    # The morning-after case: connect → stream → 403 → reconnect, over and over. Each
+    # on_connect resets KiteTicker's `attempts` to 1, so the consecutive-count check never
+    # fires — but the rolling reconnect-rate does.
+    reader = _reader()
+    clock = [1000.0]
+    reader._clock = lambda: clock[0]
+    for _ in range(live_app._FLAP_MAX_RECONNECTS - 1):
+        reader.on_reconnect(None, 1)      # attempts stays low (link keeps briefly reconnecting)
+        clock[0] += 20                    # 20s apart → all inside the 180s window
+    assert not reader.needs_rebuild()
+    reader.on_reconnect(None, 1)          # the Nth reconnect inside the window
+    assert reader.needs_rebuild()
+
+
+def test_reconnects_spread_beyond_window_do_not_trigger_rebuild():
+    # Occasional drops far apart (a flaky network, not a broken link) must NOT rebuild.
+    reader = _reader()
+    clock = [1000.0]
+    reader._clock = lambda: clock[0]
+    for _ in range(10):
+        reader.on_reconnect(None, 1)
+        clock[0] += live_app._FLAP_WINDOW_SECONDS + 1   # each reconnect ages out the last
+    assert not reader.needs_rebuild()
+
+
 def test_ist_today_uses_ist_not_utc():
     # 18:56 UTC on a Sunday is already past midnight IST → Monday. date.today() (UTC)
     # would say Sunday; _ist_today must say Monday.

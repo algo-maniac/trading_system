@@ -71,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
+    from trading_system.agents.scheduler_watchdog import start_watchdog
+
     sched = BackgroundScheduler(timezone=IST)
     sched.add_job(lambda: run_tick(core),
                   CronTrigger.from_crontab(s.token_alert_cron, timezone=IST),
@@ -88,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
+    # Restart the process if the scheduler thread dies (host suspend) — otherwise the
+    # notifier goes silent exactly when you'd rely on it to nag about a missing token.
+    start_watchdog(sched, "token_notifier", stop, grace_seconds=600.0)
     run_tick(core)   # startup catch-up, same idiom as reader/analyst
     stop.wait()
     sched.shutdown(wait=False)
