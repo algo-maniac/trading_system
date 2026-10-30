@@ -1,170 +1,242 @@
-# Trading System — Phase 1: Data Foundation
+# Multi-Agent Algorithmic Trading Platform
 
-Agentic AI-powered algorithmic trading platform. This phase delivers reliable, deterministic
-data infrastructure for the NIFTY 50: historical ingestion from Zerodha Kite Connect,
-cleaning, feature computation, and a point-in-time replay engine.
+An event-driven, multi-agent system for researching, validating and **paper-trading** equity
+strategies on India's NSE. Independent Python services (data readers, an LLM-powered news
+analyst, a strategist, a trader and a reporter) cooperate over a Redis Streams message bus,
+with TimescaleDB as the system of record.
 
-## Quick start
+> **Paper trading only.** The platform places no real orders. Nothing here is financial advice.
 
-### 1. Prerequisites
+**At a glance:** 8 containerised agent services · Redis Streams with at-least-once delivery and
+idempotent consumers · live WebSocket market data · Claude-powered news analysis with hard cost
+guardrails · a replay harness that runs the production binaries on history · ~11K lines of
+Python · 360+ tests
 
-- Python 3.11+
-- Docker + Docker Compose
-- Zerodha Kite Connect app with **Historical Data API add-on** enabled
+---
 
-### 2. Install
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        WS[Kite WebSocket<br/>live ticks]
+        HIST[Kite historical API]
+        NEWS[StockInsights<br/>news & filings]
+    end
+
+    subgraph Agents
+        RL[reader-live<br/>ticks → 1m/5m bars]
+        RD[reader<br/>EOD daily bars]
+        AN[analyst<br/>LLM news review]
+        ST[strategist<br/>strategy book]
+        TR[trader<br/>risk gate + paper broker]
+        RP[reporter<br/>daily/weekly/monthly]
+        TN[token-notifier<br/>auth expiry alerts]
+    end
+
+    BUS[(Redis Streams<br/>market.bars · trade.signals · alerts)]
+    DB[(TimescaleDB<br/>OHLCV · features · ledger · universe)]
+    LLM{{Claude API}}
+
+    WS --> RL
+    HIST --> RD
+    NEWS --> AN
+    AN <--> LLM
+    RL -- bars --> BUS
+    RD -- bars --> BUS
+    AN -- admitted universe / focus list --> DB
+    BUS -- bars --> ST
+    ST -- signals --> BUS
+    BUS -- signals + bars --> TR
+    TR -- orders · fills · equity --> DB
+    DB --> RP
+    RL & RD & AN --> DB
+```
+
+Every agent is a separate long-running process built from one shared image, with its own
+`restart: unless-stopped` policy. They share a core library (`trading_system.*`) and talk only
+through the bus and the database. A crash in one agent never takes down another.
+
+### The agents
+
+| Agent | Responsibility |
+|---|---|
+| **reader-live** | Subscribes to the Kite WebSocket for a dynamic focus list, aggregates ticks into 1-minute and 5-minute bars, computes intraday features live, and publishes to `market.bars`. |
+| **reader** | Fetches end-of-day daily bars for the Nifty 200 plus admitted names after market close, attaches features, and publishes them. |
+| **analyst** | Runs a daily news and filings sweep. Candidates pass quantitative gates (liquidity, listing history) and then a **Claude** review before admission to the tradable universe. Also builds the focus list for the live reader. |
+| **strategist** | Runs the validated strategy book (cross-sectional momentum, swing pullback, gap-day opening-range breakout) on incoming bars and emits `SignalEvent`s with deterministic IDs. |
+| **trader** | Applies risk checks (position sizing, exposure caps), routes orders to the paper broker, and enforces stops, targets and the 15:15 intraday square-off. Writes the ledger and end-of-day equity snapshots. |
+| **reporter** | Generates daily, weekly and monthly performance reports. Generation is data-driven: a period is reported once the next period's data exists, so the same code works live and in replay. |
+| **token-notifier** | Emails an alert when the daily broker token expires, so the stack never stalls silently. |
+| **backtester** | Forward-tests a strategy on the live bar stream (paper-test harness). |
+| **replayer** | Re-publishes stored history session by session for the replay harness (see below). |
+
+---
+
+## Key design decisions
+
+**At-least-once delivery + idempotency = effectively-once.** Consumers use Redis Streams
+consumer groups and `XACK` only after processing. A crash leaves the message pending, and it is
+replayed on restart. Duplicate side effects are prevented by deterministic signal IDs
+(a hash of strategy, symbol, bar time and side) and `ON CONFLICT` upserts in the ledger.
+
+**Redis Streams, behind an interface.** With ~200 symbols on one host, Kafka's partitioned
+scale-out isn't needed, and Redis was already a dependency for token caching and budgets. The bus
+is a `BarBus`/`SignalBus` protocol, so a Kafka adapter could be swapped in without touching the
+agents.
+
+**Crash-only agents.** All state lives in Postgres or Redis. On startup every agent runs a
+catch-up cycle for anything it missed, so recovery and a normal start are the same code path.
+A scheduler watchdog force-restarts any agent whose APScheduler job stops advancing (seen in
+practice after host sleep/resume), and heartbeats tell a quiet agent apart from a stuck one.
+
+**LLM in the loop, with guardrails.** The LLM only makes the judgment call that rules can't:
+"is this news-driven name worth adding to the universe?" Cheap deterministic gates run first.
+The review **fails closed**: any API error, timeout or malformed JSON means "don't admit". A
+Redis-backed daily request budget and a hard monthly USD spend cap (computed from token
+`usage`, with an alert threshold) bound the cost. A typical review costs about $0.0007.
+
+**Paper == backtest, proven by a test.** `tests/test_paper_equivalence.py` feeds the same bars
+through the batch backtest engine and through the live strategist → bus → trader → paper broker
+path, and asserts the trades and equity match exactly. Paper trading isn't a separate, untested
+code path.
+
+**A replay harness that runs the production binaries.** The same strategist, trader and
+reporter containers run against an isolated database clone and Redis DB (`NAMESPACE=replay`,
+which the replayer enforces). A full quarter (64 sessions, 12K+ bars) replays end to end in
+under 5 minutes, which tests serialization, consumer groups, the ledger and report triggers
+together.
+
+**Gap-aware, idempotent ingestion.** Before calling the broker API, ingestion compares stored
+bar counts with the NSE trading calendar and fetches only the missing day ranges. A fully covered
+range makes zero API calls. The API client is rate-limited and retries with jittered exponential
+backoff, and raw responses are archived as Parquet before any transformation.
+
+---
+
+## Strategy research
+
+The trading logic was validated before any automation was built on it:
+
+- Event-driven backtest engine with fees, slippage, position sizing and exposure caps; no
+  look-ahead (features are point-in-time).
+- Walk-forward and rolling-window validation, plus a held-out out-of-sample period.
+- Nine strategies researched. Several were rejected with evidence (for example, plain intraday
+  VWAP reversion can't clear transaction costs). The locked book combines cross-sectional
+  momentum (30%) and swing pullback (70%) over a 200-stock universe.
+
+| Locked book, 2023–25 backtest | |
+|---|---|
+| CAGR | 16.6% |
+| Sharpe ratio | 1.56 |
+| Max drawdown | −12.3% |
+| Profit factor | 2.21 |
+
+The book is built for risk-adjusted return and drawdown control, not to beat buy-and-hold in a
+strong bull market. Past and backtested performance does not predict future results.
+
+---
+
+## Tech stack
+
+**Language:** Python 3.11+ · **Messaging:** Redis Streams · **Storage:** TimescaleDB
+(PostgreSQL), Alembic migrations, Parquet raw archive · **Market data:** Zerodha Kite Connect
+(REST + WebSocket) · **LLM:** Anthropic Claude API · **News:** StockInsights · **Data:** pandas,
+NumPy, pandas-market-calendars · **Ops:** Docker Compose, APScheduler, structlog (JSON logs),
+SMTP alerts · **Quality:** pytest (+ fakeredis), ruff, mypy
+
+---
+
+## Repository layout
+
+```
+src/trading_system/
+├── agents/        reader · reader-live · analyst · strategist · trader · reporter
+│                  token_notifier · backtester · replayer · heartbeat · scheduler_watchdog
+├── bus/           Redis Streams bus: protocols, serde, signal events
+├── data/          Kite auth/client, ingestion, cleaning, storage, screener, news client
+├── features/      Technical + intraday features, versioned feature store
+├── strategy/      9 strategies + registry + multi-strategy book
+├── backtest/      Event-driven engine (batch and incremental feed)
+├── risk/          Position sizing, exposure caps, stop rules
+├── execution/     Paper broker, fee model, Postgres ledger
+├── portfolio/     Backtest + live portfolio state
+├── analytics/     Metrics, walk-forward, sweeps, allocation, reports
+├── llm/           LLM protocol, Anthropic client, deterministic mock
+├── net/           Rate limits, daily budgets, monthly spend cap, mailer
+├── replay/        Deterministic point-in-time bar replay
+└── cli.py         `trading` CLI
+tests/             360+ tests (unit, equivalence, agent lifecycle)
+db/                Schema + Alembic migrations
+```
+
+---
+
+## Getting started
+
+**Prerequisites:** Python 3.11+, Docker, and a Zerodha Kite Connect app with the historical
+data add-on.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-```
-
-### 3. Configure credentials
-
-```bash
-cp .env.example .env
-# Edit .env — set KITE_API_KEY and KITE_API_SECRET
-```
-
-> ⚠️ Never commit `.env`. It is gitignored.
-
-### 4. Start infrastructure
-
-```bash
-docker compose up -d
-# TimescaleDB applies db/schema.sql automatically on first start
-```
-
-### 5. Authenticate with Kite (run every trading day)
-
-```bash
-trading auth
-# Follow the printed URL → log in → paste the redirect URL back
-```
-
-### 6. Sync instrument master
-
-```bash
+cp .env.example .env            # fill in Kite keys; optional: ANTHROPIC / STOCKINSIGHTS / SMTP
+docker compose up -d timescaledb redis
+trading auth                    # Kite token expires daily; run each morning
 trading sync-instruments
+trading ingest --interval day --from 2023-01-01 --to 2025-12-31
 ```
 
-### 7. Ingest historical data
+**Research:**
 
 ```bash
-# Example: daily bars for all NIFTY 50 symbols over 1 year
-trading ingest --interval day --from 2023-01-01 --to 2023-12-31
-
-# Specific symbols + minute bars (slower, requires paid historical add-on)
-trading ingest -s RELIANCE -s TCS --interval minute --from 2024-01-01 --to 2024-03-31
+trading backtest --strategy swing_pullback --feature-version v3 --from 2023-01-01 --to 2025-12-31
+trading backtest-book --sleeve xsec_momentum:0.3 --sleeve swing_pullback:0.7 \
+    --feature-version v3 --from 2023-01-01 --to 2025-12-31
+trading backtest-rolling --help   # rolling-window robustness
 ```
 
-### 8. Build features
+**Run the live paper-trading stack:**
 
 ```bash
-trading build-features --interval day --from 2023-01-01 --to 2023-12-31
+docker compose up -d            # all agents
+trading report --period daily --date 2026-07-04
 ```
 
-### 9. Replay and verify
+**Replay a historic quarter through the real agents:**
 
 ```bash
-trading replay --interval day --from 2023-01-01 --to 2023-12-31 --limit 30
-trading verify --interval day --from 2023-01-01 --to 2023-12-31
+scripts/replay_reset.sh
+docker compose -f docker-compose.replay.yml up -d strategist trader reporter
+docker compose -f docker-compose.replay.yml run --rm replayer \
+    --from 2025-01-01 --to 2025-04-03 --intervals day
 ```
 
-### Run tests
+**Tests:**
 
 ```bash
-pytest -v
+pytest
 ```
 
-## Live paper-trading stack (Phase 5)
+---
 
-```bash
-docker-compose up -d               # timescaledb, redis, reader(s), analyst,
-                                   # strategist, trader, reporter
-trading auth                       # every morning (~before 08:30 IST)
-trading report --period daily --date 2026-07-04 [--force]   # on-demand report
-```
+## Roadmap
 
-Reports also generate automatically (data-driven: a period is written once the next
-period's data exists) into `reports/live/{daily,weekly,monthly}/` and the `reports`
-DB table. LLM admission reviews use Claude Haiku (`LLM_PROVIDER=anthropic` in .env),
-hard-capped at `LLM_MONTHLY_USD_CAP` per month.
-
-## Replay harness (test the whole pipeline on historic data)
-
-Runs the SAME strategist/trader/reporter binaries against a `trading_replay` DB
-clone + Redis DB 1 — fully isolated from the live paper book, months replay in
-minutes. Consumers must start BEFORE the replayer (consumer groups begin at the
-stream tail):
-
-```bash
-scripts/replay_reset.sh                                        # rebuild replay DB
-docker-compose -f docker-compose.replay.yml up -d strategist trader reporter
-docker-compose -f docker-compose.replay.yml run --rm replayer \
-    --from 2025-01-01 --to 2025-04-03 --intervals day          # ~5 min for a quarter
-# optional: --intervals day,5minute · --with-news (StockInsights, MockLLM)
-```
-
-Replay reports land in `reports/replay/…`; inspect the ledger with
-`psql -d trading_replay` (`live_orders`, `live_positions`, `live_equity`).
-
-## Architecture
-
-```
-CLI (trading auth | sync-instruments | ingest | build-features | replay | verify
-     | backtest | backtest-book | backtest-multi | backtest-sweep | backtest-rolling | report)
-  │
-  ├── data/            Kite ingest → clean → store; news feed (StockInsights)
-  │   ├── auth.py            Kite login + daily token cache (Redis)
-  │   ├── kite_client.py     Rate-limited, chunked, retrying Kite wrapper
-  │   ├── instruments.py     Instrument master sync + NIFTY 50 token resolution
-  │   ├── ingestion.py       Orchestrates fetch → clean → upsert (feature-integrated, gap-aware)
-  │   ├── cleaning.py        OHLC validation, dedup, gap detection vs NSE calendar
-  │   ├── storage.py         TimescaleDB read/write repositories
-  │   ├── raw_archive.py     Raw Parquet archive of API responses
-  │   ├── screener.py        Volatile mid-cap universe screen
-  │   └── stockinsights_client.py · news_store.py   News fetch + storage
-  ├── features/        RSI, MACD, MAs, momentum, volatility, volume spikes
-  ├── replay/engine.py Deterministic, point-in-time bar replay
-  ├── strategy/        9 strategies: momentum, cross-sectional, mean-reversion, VWAP-reversion,
-  │                    ORB, swing pullback/breakout (+ registry, multi-strategy book)
-  ├── backtest/        Event-driven backtest engine + result persistence
-  ├── analytics/       Sharpe/drawdown metrics, book allocation, walk-forward, sweeps, reports
-  ├── risk/            Position sizing, exposure caps, stop rules
-  ├── portfolio/       Backtest + live portfolio state
-  ├── execution/       Paper broker, fee model, Postgres ledger (live_orders/positions/equity)
-  ├── llm/             LLM abstraction + Anthropic Haiku client (+ mock)
-  ├── bus/             Redis Streams message bus (serde, signals)
-  └── agents/          Long-running services over the bus:
-      ├── reader · reader-live   Historical + live WebSocket data plane
-      ├── analyst                News-driven market analysis + dynamic universe
-      ├── strategist             Runs the strategy book, emits trade signals
-      ├── trader                 LLM-reviewed admission → paper broker → ledger
-      ├── reporter               Daily/weekly/monthly performance reports
-      ├── backtester             Forward / paper-test harness
-      └── replayer               Feeds historic bars for the replay harness
-```
-
-## Kite Connect limitations
-
-| Constraint | Impact |
+| Phase | Status |
 |---|---|
-| Access token expires daily | `trading auth` required each morning |
-| Historical Data API is a paid add-on | Ingestion fails without the subscription |
-| Minute data: max ~60 days per request | Client chunks automatically |
-| ~3 historical requests/sec rate limit | Client throttles automatically |
-| No news API | News Intelligence Agent is Phase 2+ |
-| No corporate actions data | Price adjustment deferred; raw unadjusted prices stored |
+| Data foundation: ingestion, cleaning, features, point-in-time replay | Done |
+| Backtesting engine, risk and execution models, analytics | Done |
+| Strategy research with rolling and out-of-sample validation | Done |
+| Agent platform: Redis Streams bus, reader and backtester agents | Done |
+| Live paper trading: WebSocket data, analyst, strategist, trader, reporter, replay harness | Done |
+| LLM shadow review of trade signals (fails open) + lessons knowledge base | Next |
+| Live order execution with kill switches | Planned |
 
-## Phase roadmap
+## Known limitations
 
-| Phase | Status | Description |
-|---|---|---|
-| 1 — Data Foundation | ✅ Done | Historical ingest, cleaning, features, replay |
-| 2 — Backtesting | ✅ Done | Event-driven engine, Sharpe/drawdown analytics, risk & execution models |
-| 3 — Strategy R&D | ✅ Done | 9 strategies, cross-sectional momentum, rolling-window & walk-forward validation, locked book |
-| 4 — Agentic Platform | ✅ Done | Redis-Streams bus, reader/backtester agents, intraday + swing strategies |
-| 5 — Live Paper Trading | ✅ Done | Live WebSocket data plane, analyst/strategist/trader/reporter agents, LLM admission reviews, replay harness |
-| 6 — Live Trading | Planned | Zerodha order execution, kill switches |
-| 7 — Adaptive Intelligence | Planned | Regime-aware strategy switching, RL |
+- Kite access tokens expire daily; `trading auth` is a manual morning step (the token-notifier
+  emails when it lapses).
+- OHLCV is stored unadjusted for corporate actions; a crash-quarantine rule guards momentum
+  ranking against demerger price drops.
+- Pre-2020 history for the 200-stock universe has survivorship bias, so deep-history checks use
+  the 50-stock set.
