@@ -130,6 +130,21 @@ services:
         condition: service_healthy
     command: ["python", "-m", "trading_system.agents.analyst.app"]
 
+  # Phase 5d: shadow LLM review of BUY signals (journal only; trader never waits on it).
+  reviewer:
+    image: trading-system:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trading:trading_pass@timescaledb:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "trading_system.agents.reviewer.app"]
+
   # Phase 5d': data-driven daily/weekly/monthly reports (DB rows + markdown files).
   reporter:
     image: trading-system:latest

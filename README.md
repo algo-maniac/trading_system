@@ -7,10 +7,10 @@ with TimescaleDB as the system of record.
 
 > **Paper trading only.** The platform places no real orders. Nothing here is financial advice.
 
-**At a glance:** 8 containerised agent services · Redis Streams with at-least-once delivery and
-idempotent consumers · live WebSocket market data · Claude-powered news analysis with hard cost
-guardrails · a replay harness that runs the production binaries on history · ~11K lines of
-Python · 360+ tests
+**At a glance:** 9 containerised agent services · Redis Streams with at-least-once delivery and
+idempotent consumers · live WebSocket market data · Claude-powered news analysis and a tool-using
+LLM trade reviewer with evals, all under hard cost guardrails · a replay harness that runs the production binaries on history · ~11K lines of
+Python · 380+ tests
 
 ---
 
@@ -31,6 +31,9 @@ flowchart TD
     BUS -- signals and bars --> TR[trader: risk gate and paper broker]
     TR -- orders, fills, equity --> DB[(TimescaleDB: OHLCV, features, ledger, universe)]
     DB --> RP[reporter: daily, weekly, monthly reports]
+    BUS -- signals --> RV[reviewer: tool-using LLM agent]
+    RV <--> LLM
+    RV -- shadow verdicts --> DB
     TN[token-notifier] -. emails on token expiry .-> OPS([operator])
 ```
 
@@ -47,6 +50,7 @@ through the bus and the database. A crash in one agent never takes down another.
 | **analyst** | Runs a daily news and filings sweep. Candidates pass quantitative gates (liquidity, listing history) and then a **Claude** review before admission to the tradable universe. Also builds the focus list for the live reader. |
 | **strategist** | Runs the validated strategy book (cross-sectional momentum, swing pullback, gap-day opening-range breakout) on incoming bars and emits `SignalEvent`s with deterministic IDs. |
 | **trader** | Applies risk checks (position sizing, exposure caps), routes orders to the paper broker, and enforces stops, targets and the 15:15 intraday square-off. Writes the ledger and end-of-day equity snapshots. |
+| **reviewer** | Shadow-reviews every BUY signal with a **tool-using Claude agent**: the model calls tools for the book's position, recent news, price history and sleeve exposure (all point-in-time), then submits a verdict. Verdicts are journaled, never block the trader, and fail open. `trading eval-reviews` scores them against realised forward returns. |
 | **reporter** | Generates daily, weekly and monthly performance reports. Generation is data-driven: a period is reported once the next period's data exists, so the same code works live and in replay. |
 | **token-notifier** | Emails an alert when the daily broker token expires, so the stack never stalls silently. |
 | **backtester** | Forward-tests a strategy on the live bar stream (paper-test harness). |
@@ -76,6 +80,14 @@ practice after host sleep/resume), and heartbeats tell a quiet agent apart from 
 The review **fails closed**: any API error, timeout or malformed JSON means "don't admit". A
 Redis-backed daily request budget and a hard monthly USD spend cap (computed from token
 `usage`, with an alert threshold) bound the cost. A typical review costs about $0.0007.
+
+**A tool-using agent, evaluated against outcomes.** The reviewer runs a bounded manual
+tool-use loop (max 6 turns) over strict-schema tools and ends by calling `submit_verdict`.
+Every turn passes the monthly spend precheck and records its cost. All tool data is filtered
+to the signal's timestamp, so verdicts produced in replay are honest. The eval harness labels
+each verdict with the forward return over N bars and reports veto precision, loser recall
+and the return lift from following the reviewer. A deterministic rules reviewer is the
+baseline the LLM has to beat.
 
 **Paper == backtest, proven by a test.** `tests/test_paper_equivalence.py` feeds the same bars
 through the batch backtest engine and through the live strategist → bus → trader → paper broker
@@ -133,7 +145,7 @@ SMTP alerts · **Quality:** pytest (+ fakeredis), ruff, mypy
 ```
 src/trading_system/
 ├── agents/        reader · reader-live · analyst · strategist · trader · reporter
-│                  token_notifier · backtester · replayer · heartbeat · scheduler_watchdog
+│                  reviewer · token_notifier · backtester · replayer · heartbeat · watchdog
 ├── bus/           Redis Streams bus: protocols, serde, signal events
 ├── data/          Kite auth/client, ingestion, cleaning, storage, screener, news client
 ├── features/      Technical + intraday features, versioned feature store
@@ -143,11 +155,11 @@ src/trading_system/
 ├── execution/     Paper broker, fee model, Postgres ledger
 ├── portfolio/     Backtest + live portfolio state
 ├── analytics/     Metrics, walk-forward, sweeps, allocation, reports
-├── llm/           LLM protocol, Anthropic client, deterministic mock
+├── llm/           LLM protocol, Anthropic clients, signal-review agent loop, mocks
 ├── net/           Rate limits, daily budgets, monthly spend cap, mailer
 ├── replay/        Deterministic point-in-time bar replay
 └── cli.py         `trading` CLI
-tests/             360+ tests (unit, equivalence, agent lifecycle)
+tests/             380+ tests (unit, equivalence, agent lifecycle)
 db/                Schema + Alembic migrations
 ```
 
@@ -210,7 +222,8 @@ pytest
 | Strategy research with rolling and out-of-sample validation | Done |
 | Agent platform: Redis Streams bus, reader and backtester agents | Done |
 | Live paper trading: WebSocket data, analyst, strategist, trader, reporter, replay harness | Done |
-| LLM shadow review of trade signals (fails open) + lessons knowledge base | Next |
+| Tool-using LLM shadow review of trade signals + eval harness | Done |
+| Lessons knowledge base from reviewed outcomes; decide whether reviews gate trades | Next |
 | Live order execution with kill switches | Planned |
 
 ## Known limitations

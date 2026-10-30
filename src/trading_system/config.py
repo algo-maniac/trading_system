@@ -190,6 +190,12 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = 512
     llm_monthly_usd_cap: float = 2.0
     llm_spend_alert_usd: float = 1.5
+    # --- Phase 5d: shadow signal reviewer (tool-using agent, fails OPEN) ---
+    # Sonnet for verdicts (the Haiku/Sonnet split chosen for Phase 5); shares the
+    # monthly llm_monthly_usd_cap with admissions. A review is ~3-4 turns ≈ $0.01-0.02.
+    signal_review_model: str = "claude-sonnet-5"
+    signal_review_max_turns: int = 6
+    signal_review_daily_budget: int = 20
     admission_max_new_per_day: int = 10     # caps Kite backfill burst from news names
     # Analyst sweep schedule (IST): evening filings sweeps + pre-open sweep; the focus
     # build runs as part of the 08:15 sweep (after it, same cycle).

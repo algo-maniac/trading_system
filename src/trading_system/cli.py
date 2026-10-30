@@ -1000,5 +1000,41 @@ def backtest_report(run_id: int = typer.Argument(..., help="Backtest run ID")) -
     console.print(table)
 
 
+@app.command("eval-reviews")
+def eval_reviews(
+    horizon: int = typer.Option(5, "--horizon", help="Forward window in daily bars"),
+    cost: float = typer.Option(0.002, "--cost", help="Round-trip cost; returns at or below are losers"),
+    reviewer: str = typer.Option(None, "--reviewer", help="Only verdicts from this reviewer (mock | anthropic)"),
+) -> None:
+    """Score the shadow signal reviewer's verdicts against realised forward returns."""
+    from trading_system.analytics.review_eval import evaluate, load_outcomes
+    from trading_system.data.storage import get_connection
+
+    with get_connection() as conn:
+        rows = load_outcomes(conn, horizon=horizon, reviewer=reviewer)
+    if not rows:
+        console.print("[yellow]No scorable reviews yet (need verdicts with "
+                      f"{horizon} later daily bars).[/]")
+        raise typer.Exit()
+    rep = evaluate(rows, cost=cost)
+
+    def pct(x: float | None) -> str:
+        return "—" if x is None else f"{x:.1%}"
+
+    table = Table(title=f"Signal reviewer eval — {horizon}-bar horizon, cost {cost:.2%}")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for name, value in [
+        ("Signals scored", str(rep.n)), ("Approved", str(rep.approved)),
+        ("Vetoed", str(rep.vetoed)), ("Losers (≤ cost)", str(rep.losers)),
+        ("Veto precision", pct(rep.precision)), ("Loser recall", pct(rep.recall)),
+        ("Accuracy", pct(rep.accuracy)), ("Mean return — all", pct(rep.mean_return_all)),
+        ("Mean return — approved", pct(rep.mean_return_approved)),
+        ("Mean return — vetoed", pct(rep.mean_return_vetoed)), ("Lift", pct(rep.lift)),
+    ]:
+        table.add_row(name, value)
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
