@@ -17,40 +17,21 @@ Python · 360+ tests
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Sources
-        WS[Kite WebSocket<br/>live ticks]
-        HIST[Kite historical API]
-        NEWS[StockInsights<br/>news & filings]
-    end
-
-    subgraph Agents
-        RL[reader-live<br/>ticks → 1m/5m bars]
-        RD[reader<br/>EOD daily bars]
-        AN[analyst<br/>LLM news review]
-        ST[strategist<br/>strategy book]
-        TR[trader<br/>risk gate + paper broker]
-        RP[reporter<br/>daily/weekly/monthly]
-        TN[token-notifier<br/>auth expiry alerts]
-    end
-
-    BUS[(Redis Streams<br/>market.bars · trade.signals · alerts)]
-    DB[(TimescaleDB<br/>OHLCV · features · ledger · universe)]
-    LLM{{Claude API}}
-
-    WS --> RL
-    HIST --> RD
-    NEWS --> AN
-    AN <--> LLM
+flowchart TD
+    WS[Kite WebSocket: live ticks] --> RL[reader-live: ticks to 1m/5m bars]
+    HIST[Kite historical API] --> RD[reader: EOD daily bars]
+    NEWS[StockInsights: news and filings] --> AN[analyst: LLM news review]
+    AN <--> LLM{{Claude API}}
+    AN -- admitted universe and focus list --> DB
     RL -- bars --> BUS
     RD -- bars --> BUS
-    AN -- admitted universe / focus list --> DB
-    BUS -- bars --> ST
+    BUS[(Redis Streams: market.bars, trade.signals, alerts)]
+    BUS -- bars --> ST[strategist: runs the strategy book]
     ST -- signals --> BUS
-    BUS -- signals + bars --> TR
-    TR -- orders · fills · equity --> DB
-    DB --> RP
-    RL & RD & AN --> DB
+    BUS -- signals and bars --> TR[trader: risk gate and paper broker]
+    TR -- orders, fills, equity --> DB[(TimescaleDB: OHLCV, features, ledger, universe)]
+    DB --> RP[reporter: daily, weekly, monthly reports]
+    TN[token-notifier] -. emails on token expiry .-> OPS([operator])
 ```
 
 Every agent is a separate long-running process built from one shared image, with its own
