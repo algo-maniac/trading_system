@@ -5,6 +5,8 @@ strategies on India's NSE. Independent Python services (data readers, an LLM-pow
 analyst, a strategist, a trader and a reporter) cooperate over a Redis Streams message bus,
 with TimescaleDB as the system of record.
 
+**[▶ Interactive demo](https://algo-maniac.github.io/trading_system/)**: architecture walkthrough, the AI reviewer step by step, research charts and a replay of the real services.
+
 > **Paper trading only.** The platform places no real orders. Nothing here is financial advice.
 
 **At a glance:** 9 containerised agent services · Redis Streams with at-least-once delivery and
